@@ -847,7 +847,7 @@ func (e *Extractor) buildFixture(orderedTables []string) *Fixture {
 	var untouched []string
 	for _, t := range allTables {
 		if !collectedSet[t] && !e.excludeSet[shortName(t)] && !e.excludeSet[t] {
-			untouched = append(untouched, shortName(t))
+			untouched = append(untouched, t)
 		}
 	}
 	sort.Strings(untouched)

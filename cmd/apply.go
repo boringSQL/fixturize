@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/boringsql/fixturize/fixturize"
 	"github.com/spf13/cobra"
@@ -36,22 +37,29 @@ Examples:
 func init() {
 	RootCmd.AddCommand(applyCmd)
 
-	applyCmd.Flags().StringVar(&applyConn, "connection", "", "PostgreSQL connection string (required)")
+	applyCmd.Flags().StringVar(&applyConn, "connection", "", "PostgreSQL connection string")
 	applyCmd.Flags().BoolVar(&applyForce, "force", false, "Truncate tables before applying fixture")
 	applyCmd.Flags().BoolVar(&applyDryRun, "dry-run", false, "Show what would be done without making changes")
 	applyCmd.Flags().BoolVar(&applyDisableTriggers, "disable-triggers", false, "Disable triggers during insert (uses replica mode)")
-	applyCmd.MarkFlagRequired("connection")
 }
 
 func runApply(cmd *cobra.Command, args []string) error {
-	db, err := fixturize.OpenDB(applyConn)
+	if applyConn == "" {
+		applyConn = os.Getenv("DATABASE_URL")
+	}
+	if applyConn == "" {
+		return fmt.Errorf("connection string is required (use --connection or DATABASE_URL env var)")
+	}
+
+	conn := expandEnvVars(applyConn)
+	db, err := fixturize.OpenDB(conn)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 	defer db.Close()
 
 	options := &fixturize.ApplyOptions{
-		Connection:      applyConn,
+		Connection:      conn,
 		Fixture:         args[0],
 		Force:           applyForce,
 		DryRun:          applyDryRun,

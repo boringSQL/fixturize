@@ -61,7 +61,7 @@ Examples:
 func init() {
 	RootCmd.AddCommand(extractCmd)
 
-	extractCmd.Flags().StringVar(&extractConn, "connection", "", "PostgreSQL connection string (required)")
+	extractCmd.Flags().StringVar(&extractConn, "connection", "", "PostgreSQL connection string")
 	extractCmd.Flags().StringVar(&extractRoot, "root", "", "Root table + optional WHERE/ORDER BY/LIMIT (required)")
 	extractCmd.Flags().StringVar(&extractSchema, "schema", "public", "Default schema for unqualified names")
 	extractCmd.Flags().StringVarP(&extractOutput, "output", "o", "", "Output file path (default: extracted.json)")
@@ -72,19 +72,30 @@ func init() {
 	extractCmd.Flags().StringArrayVar(&extractMask, "mask", nil, "Mask column with SQL expression (table.column=expr, repeatable)")
 	extractCmd.Flags().IntVar(&extractStatementTimeout, "statement-timeout", 30, "Per-statement timeout in seconds")
 	extractCmd.Flags().BoolVar(&extractDryRun, "dry-run", false, "Print JSON to stdout, don't write file")
-	extractCmd.MarkFlagRequired("connection")
 	extractCmd.MarkFlagRequired("root")
 }
 
+func expandEnvVars(s string) string {
+	return os.Expand(s, os.Getenv)
+}
+
 func runExtract(cmd *cobra.Command, args []string) error {
-	db, err := fixturize.OpenDB(extractConn)
+	if extractConn == "" {
+		extractConn = os.Getenv("DATABASE_URL")
+	}
+	if extractConn == "" {
+		return fmt.Errorf("connection string is required (use --connection or DATABASE_URL env var)")
+	}
+
+	conn := expandEnvVars(extractConn)
+	db, err := fixturize.OpenDB(conn)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 	defer db.Close()
 
 	options := &fixturize.ExtractOptions{
-		Connection:       extractConn,
+		Connection:       conn,
 		Root:             extractRoot,
 		Schema:           extractSchema,
 		Output:           extractOutput,
