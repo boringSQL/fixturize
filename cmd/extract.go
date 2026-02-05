@@ -62,17 +62,16 @@ func init() {
 	RootCmd.AddCommand(extractCmd)
 
 	extractCmd.Flags().StringVar(&extractConn, "connection", "", "PostgreSQL connection string")
-	extractCmd.Flags().StringVar(&extractRoot, "root", "", "Root table + optional WHERE/ORDER BY/LIMIT (required)")
-	extractCmd.Flags().StringVar(&extractSchema, "schema", "public", "Default schema for unqualified names")
+	extractCmd.Flags().StringVar(&extractRoot, "root", "", "Root table + optional WHERE/ORDER BY/LIMIT")
+	extractCmd.Flags().StringVar(&extractSchema, "schema", "", "Default schema for unqualified names")
 	extractCmd.Flags().StringVarP(&extractOutput, "output", "o", "", "Output file path (default: extracted.json)")
 	extractCmd.Flags().IntVar(&extractLimit, "limit", 0, "Max rows per child table (0 = unlimited)")
 	extractCmd.Flags().IntVar(&extractDepth, "depth", 0, "Max FK hops from root (0 = follow everything)")
 	extractCmd.Flags().StringVar(&extractInclude, "include", "", "Extra tables to include (comma-separated)")
 	extractCmd.Flags().StringVar(&extractExclude, "exclude", "", "Tables to skip (comma-separated)")
 	extractCmd.Flags().StringArrayVar(&extractMask, "mask", nil, "Mask column with SQL expression (table.column=expr, repeatable)")
-	extractCmd.Flags().IntVar(&extractStatementTimeout, "statement-timeout", 30, "Per-statement timeout in seconds")
+	extractCmd.Flags().IntVar(&extractStatementTimeout, "statement-timeout", 0, "Per-statement timeout in seconds")
 	extractCmd.Flags().BoolVar(&extractDryRun, "dry-run", false, "Print JSON to stdout, don't write file")
-	extractCmd.MarkFlagRequired("root")
 }
 
 func expandEnvVars(s string) string {
@@ -80,14 +79,19 @@ func expandEnvVars(s string) string {
 }
 
 func runExtract(cmd *cobra.Command, args []string) error {
-	if extractConn == "" {
-		extractConn = os.Getenv("DATABASE_URL")
+	conn, root, schema, output, limit, depth, include, exclude, masks, statementTimeout := mergeExtractConfig(cmd)
+
+	if conn == "" {
+		conn = os.Getenv("DATABASE_URL")
 	}
-	if extractConn == "" {
-		return fmt.Errorf("connection string is required (use --connection or DATABASE_URL env var)")
+	if conn == "" {
+		return fmt.Errorf("connection string is required (use --connection, DATABASE_URL env var, or profile)")
+	}
+	if root == "" {
+		return fmt.Errorf("root is required (use --root or profile)")
 	}
 
-	conn := expandEnvVars(extractConn)
+	conn = expandEnvVars(conn)
 	db, err := fixturize.OpenDB(conn)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
@@ -96,21 +100,21 @@ func runExtract(cmd *cobra.Command, args []string) error {
 
 	options := &fixturize.ExtractOptions{
 		Connection:       conn,
-		Root:             extractRoot,
-		Schema:           extractSchema,
-		Output:           extractOutput,
-		Limit:            extractLimit,
-		Depth:            extractDepth,
-		Include:          parseCommaSeparated(extractInclude),
-		Exclude:          parseCommaSeparated(extractExclude),
-		Mask:             extractMask,
-		StatementTimeout: extractStatementTimeout,
+		Root:             root,
+		Schema:           schema,
+		Output:           output,
+		Limit:            limit,
+		Depth:            depth,
+		Include:          include,
+		Exclude:          exclude,
+		Mask:             masks,
+		StatementTimeout: statementTimeout,
 		DryRun:           extractDryRun,
 	}
 
 	// Delete previous output before extraction so stale data can't persist on failure
-	if !extractDryRun && extractOutput != "" {
-		os.Remove(extractOutput)
+	if !extractDryRun && output != "" {
+		os.Remove(output)
 	}
 
 	extractor := fixturize.NewExtractor(db, options)
@@ -128,7 +132,7 @@ func runExtract(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	outputPath := extractOutput
+	outputPath := output
 	if outputPath == "" {
 		outputPath = "extracted.json"
 	}
@@ -146,6 +150,74 @@ func runExtract(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Fixture written to: %s\n", outputPath)
 	return nil
+}
+
+func mergeExtractConfig(cmd *cobra.Command) (conn, root, schema, output string, limit, depth int, include, exclude, masks []string, statementTimeout int) {
+	conn = extractConn
+	root = extractRoot
+	schema = extractSchema
+	output = extractOutput
+	limit = extractLimit
+	depth = extractDepth
+	include = parseCommaSeparated(extractInclude)
+	exclude = parseCommaSeparated(extractExclude)
+	masks = extractMask
+	statementTimeout = extractStatementTimeout
+
+	if loadedProfile == nil {
+		if schema == "" {
+			schema = "public"
+		}
+		if statementTimeout == 0 {
+			statementTimeout = 30
+		}
+		return
+	}
+
+	p := loadedProfile
+
+	if !cmd.Flags().Changed("connection") && conn == "" {
+		conn = p.Connection
+	}
+	if !cmd.Flags().Changed("root") && root == "" {
+		root = p.Extract.Root
+	}
+	if !cmd.Flags().Changed("schema") {
+		if schema == "" {
+			schema = p.Schema
+		}
+	}
+	if schema == "" {
+		schema = "public"
+	}
+	if !cmd.Flags().Changed("output") && output == "" {
+		output = p.Extract.Output
+	}
+	if !cmd.Flags().Changed("limit") && limit == 0 {
+		limit = p.Extract.Limit
+	}
+	if !cmd.Flags().Changed("depth") && depth == 0 {
+		depth = p.Extract.Depth
+	}
+	if !cmd.Flags().Changed("statement-timeout") {
+		if statementTimeout == 0 {
+			statementTimeout = p.Extract.StatementTimeout
+		}
+	}
+	if statementTimeout == 0 {
+		statementTimeout = 30
+	}
+	if !cmd.Flags().Changed("include") && len(include) == 0 {
+		include = p.Extract.Include
+	}
+	if !cmd.Flags().Changed("exclude") && len(exclude) == 0 {
+		exclude = p.Extract.Exclude
+	}
+	if !cmd.Flags().Changed("mask") && len(masks) == 0 {
+		masks = p.ResolveMasks()
+	}
+
+	return
 }
 
 func parseCommaSeparated(s string) []string {

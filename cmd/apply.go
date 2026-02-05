@@ -44,14 +44,16 @@ func init() {
 }
 
 func runApply(cmd *cobra.Command, args []string) error {
-	if applyConn == "" {
-		applyConn = os.Getenv("DATABASE_URL")
+	conn, force, disableTriggers := mergeApplyConfig(cmd)
+
+	if conn == "" {
+		conn = os.Getenv("DATABASE_URL")
 	}
-	if applyConn == "" {
-		return fmt.Errorf("connection string is required (use --connection or DATABASE_URL env var)")
+	if conn == "" {
+		return fmt.Errorf("connection string is required (use --connection, DATABASE_URL env var, or profile)")
 	}
 
-	conn := expandEnvVars(applyConn)
+	conn = expandEnvVars(conn)
 	db, err := fixturize.OpenDB(conn)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
@@ -61,9 +63,9 @@ func runApply(cmd *cobra.Command, args []string) error {
 	options := &fixturize.ApplyOptions{
 		Connection:      conn,
 		Fixture:         args[0],
-		Force:           applyForce,
+		Force:           force,
 		DryRun:          applyDryRun,
-		DisableTriggers: applyDisableTriggers,
+		DisableTriggers: disableTriggers,
 	}
 
 	result, err := fixturize.ApplyFixtureFile(db, options)
@@ -78,4 +80,28 @@ func runApply(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Applied %d table(s), %d row(s) total\n", len(result.TablesApplied), totalRows)
 	return nil
+}
+
+func mergeApplyConfig(cmd *cobra.Command) (conn string, force, disableTriggers bool) {
+	conn = applyConn
+	force = applyForce
+	disableTriggers = applyDisableTriggers
+
+	if loadedProfile == nil {
+		return
+	}
+
+	p := loadedProfile
+
+	if !cmd.Flags().Changed("connection") && conn == "" {
+		conn = p.Connection
+	}
+	if !cmd.Flags().Changed("force") && !force {
+		force = p.Apply.Force
+	}
+	if !cmd.Flags().Changed("disable-triggers") && !disableTriggers {
+		disableTriggers = p.Apply.DisableTriggers
+	}
+
+	return
 }
