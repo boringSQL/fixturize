@@ -33,6 +33,7 @@ type (
 	ApplyProfile struct {
 		Force           bool `yaml:"force"`
 		DisableTriggers bool `yaml:"disable_triggers"`
+		SyncSequences   bool `yaml:"sync_sequences"`
 	}
 )
 

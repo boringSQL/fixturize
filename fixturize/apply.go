@@ -14,6 +14,7 @@ type (
 		Force           bool
 		DryRun          bool
 		DisableTriggers bool
+		SyncSequences   bool
 	}
 
 	ApplyResult struct {
@@ -112,6 +113,14 @@ func (a *Applier) Apply(fixture *Fixture) (*ApplyResult, error) {
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	if a.options.SyncSequences {
+		fmt.Print("Syncing sequences... ")
+		if err := a.syncSequences(result.TablesApplied); err != nil {
+			return nil, err
+		}
+		fmt.Println("OK")
 	}
 
 	fmt.Println("Fixture applied successfully")
@@ -220,6 +229,35 @@ func (a *Applier) checkIdentityColumn(tableName, colName string) bool {
 	}
 
 	return identityGen != nil && *identityGen == "ALWAYS"
+}
+
+func (a *Applier) syncSequences(tables []string) error {
+	for _, tableName := range tables {
+		tableInfo, err := a.schema.GetTable(tableName)
+		if err != nil {
+			continue
+		}
+
+		for colName, col := range tableInfo.Columns {
+			if !col.IsPrimaryKey {
+				continue
+			}
+
+			var seqName *string
+			err := a.db.QueryRow(`SELECT pg_get_serial_sequence($1, $2)`, tableName, colName).Scan(&seqName)
+			if err != nil || seqName == nil {
+				continue
+			}
+
+			_, err = a.db.Exec(fmt.Sprintf(
+				`SELECT setval('%s', COALESCE((SELECT MAX(%s) FROM %s), 1), true)`,
+				*seqName, QuoteIdent(colName), QuoteQualifiedTable(tableName)))
+			if err != nil {
+				return fmt.Errorf("failed to sync sequence for %s.%s: %w", tableName, colName, err)
+			}
+		}
+	}
+	return nil
 }
 
 func ApplyFixtureFile(db *sql.DB, options *ApplyOptions) (*ApplyResult, error) {

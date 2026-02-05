@@ -32,6 +32,7 @@ Examples:
 	applyForce           bool
 	applyDryRun          bool
 	applyDisableTriggers bool
+	applySyncSequences   bool
 )
 
 func init() {
@@ -41,10 +42,11 @@ func init() {
 	applyCmd.Flags().BoolVar(&applyForce, "force", false, "Truncate tables before applying fixture")
 	applyCmd.Flags().BoolVar(&applyDryRun, "dry-run", false, "Show what would be done without making changes")
 	applyCmd.Flags().BoolVar(&applyDisableTriggers, "disable-triggers", false, "Disable triggers during insert (uses replica mode)")
+	applyCmd.Flags().BoolVar(&applySyncSequences, "sync-sequences", false, "Sync sequences to max ID after loading")
 }
 
 func runApply(cmd *cobra.Command, args []string) error {
-	conn, force, disableTriggers := mergeApplyConfig(cmd)
+	conn, force, disableTriggers, syncSequences := mergeApplyConfig(cmd)
 
 	if conn == "" {
 		conn = os.Getenv("DATABASE_URL")
@@ -66,6 +68,7 @@ func runApply(cmd *cobra.Command, args []string) error {
 		Force:           force,
 		DryRun:          applyDryRun,
 		DisableTriggers: disableTriggers,
+		SyncSequences:   syncSequences,
 	}
 
 	result, err := fixturize.ApplyFixtureFile(db, options)
@@ -82,10 +85,11 @@ func runApply(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func mergeApplyConfig(cmd *cobra.Command) (conn string, force, disableTriggers bool) {
+func mergeApplyConfig(cmd *cobra.Command) (conn string, force, disableTriggers, syncSequences bool) {
 	conn = applyConn
 	force = applyForce
 	disableTriggers = applyDisableTriggers
+	syncSequences = applySyncSequences
 
 	if loadedProfile == nil {
 		return
@@ -101,6 +105,9 @@ func mergeApplyConfig(cmd *cobra.Command) (conn string, force, disableTriggers b
 	}
 	if !cmd.Flags().Changed("disable-triggers") && !disableTriggers {
 		disableTriggers = p.Apply.DisableTriggers
+	}
+	if !cmd.Flags().Changed("sync-sequences") && !syncSequences {
+		syncSequences = p.Apply.SyncSequences
 	}
 
 	return
