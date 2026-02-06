@@ -392,3 +392,64 @@ func TestMaskApplication(t *testing.T) {
 		t.Errorf("MasksApplied should contain the mask spec, got: %v", fixture.Meta.MasksApplied)
 	}
 }
+
+func TestIdentityColumns(t *testing.T) {
+	resetDB(t, testDB)
+	seedAll(t, testDB)
+
+	// get the source audit_logs id for comparison
+	var sourceID int
+	if err := testDB.QueryRow("SELECT id FROM audit_logs LIMIT 1").Scan(&sourceID); err != nil {
+		t.Fatalf("query source audit_logs id: %v", err)
+	}
+
+	result := extractFixture(t, testDB, &ExtractOptions{
+		Root:   "organizations WHERE id = 1",
+		Schema: "public",
+	})
+	fixture := result.Fixture
+
+	logs := fixture.Tables["public.audit_logs"]
+	if logs == nil {
+		t.Fatal("missing public.audit_logs in fixture")
+	}
+
+	idIdx := colIndex(logs, "id")
+	if idIdx < 0 {
+		t.Fatal("id column missing from audit_logs — identity column values not extracted")
+	}
+
+	// Verify extracted id matches source
+	if len(logs.Rows) != 1 {
+		t.Fatalf("expected 1 audit_logs row, got %d", len(logs.Rows))
+	}
+	extractedID := fmt.Sprintf("%v", logs.Rows[0][idIdx])
+	if extractedID != fmt.Sprintf("%v", sourceID) {
+		t.Errorf("expected audit_logs id=%d, got %s", sourceID, extractedID)
+	}
+
+	// Round-trip: truncate and re-apply
+	resetDB(t, testDB)
+	applyFixture(t, testDB, fixture, &ApplyOptions{Force: true})
+
+	// Verify applied row matches
+	var (
+		appliedID int
+		orgID     int
+		action    string
+	)
+
+	err := testDB.QueryRow("SELECT id, org_id, action FROM audit_logs").Scan(&appliedID, &orgID, &action)
+	if err != nil {
+		t.Fatalf("query applied audit_logs: %v", err)
+	}
+	if appliedID != sourceID {
+		t.Errorf("applied id=%d, want %d", appliedID, sourceID)
+	}
+	if orgID != 1 {
+		t.Errorf("applied org_id=%d, want 1", orgID)
+	}
+	if action != "created_workspace" {
+		t.Errorf("applied action=%q, want 'created_workspace'", action)
+	}
+}
