@@ -37,13 +37,13 @@ type (
 	}
 
 	Extractor struct {
-		db             *sql.DB
-		tx             *sql.Tx
-		schema         *DatabaseSchema
-		options        *ExtractOptions
-		invertedGraph  map[string][]fkEdge
-		collected      map[string][]map[string]any
-		collectedPKs   map[string]map[any]bool
+		db              *sql.DB
+		tx              *sql.Tx
+		schema          *DatabaseSchema
+		options         *ExtractOptions
+		invertedGraph   map[string][]fkEdge
+		collected       map[string][]map[string]any
+		collectedPKs    map[string]map[any]bool
 		excludeSet      map[string]bool
 		generatedCols   map[string]map[string]bool
 		identityTables  map[string]bool
@@ -367,7 +367,8 @@ func (e *Extractor) buildInvertedGraph() {
 
 func (e *Extractor) loadGeneratedColumns() error {
 	query := `
-		SELECT table_schema || '.' || table_name, column_name, identity_generation
+		SELECT table_schema || '.' || table_name, column_name,
+		       is_generated, identity_generation
 		FROM information_schema.columns
 		WHERE (is_generated = 'ALWAYS' OR identity_generation = 'ALWAYS')
 		  AND table_schema NOT IN ('pg_catalog', 'information_schema')
@@ -380,17 +381,25 @@ func (e *Extractor) loadGeneratedColumns() error {
 	defer rows.Close()
 
 	for rows.Next() {
-		var tableName, colName string
+		var tableName, colName, isGenerated string
 		var identityGen *string
-		if err := rows.Scan(&tableName, &colName, &identityGen); err != nil {
+		if err := rows.Scan(&tableName, &colName, &isGenerated, &identityGen); err != nil {
 			return err
 		}
 
-		if _, ok := e.generatedCols[tableName]; !ok {
-			e.generatedCols[tableName] = make(map[string]bool)
+		// there's a problem with computed columns and how they need to be treated
+		// - computed colums (GENERATED ALWAYS AS expr STORED) are exlcuded from
+		//   the extraction.
+		// - identity columns (GENERATED ... AS IDENTITY) are kept to maintain the
+		//   referential integrity; apply side uses OVERRIDE SYTEM VALUE
+		if isGenerated == "ALWAYS" {
+			if _, ok := e.generatedCols[tableName]; !ok {
+				e.generatedCols[tableName] = make(map[string]bool)
+			}
+			e.generatedCols[tableName][colName] = true
 		}
-		e.generatedCols[tableName][colName] = true
 
+		// track identity tables
 		if identityGen != nil && *identityGen == "ALWAYS" {
 			e.identityTables[tableName] = true
 		}
