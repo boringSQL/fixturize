@@ -153,15 +153,41 @@ func getTables(db *sql.DB) ([]string, error) {
 
 func getPartitionParents(db *sql.DB) (map[string]string, error) {
 	query := `
+		WITH RECURSIVE partition_tree AS (
+			-- base: direct children of root partitioned tables
+			SELECT
+				child.oid AS partition_oid,
+				parent.oid AS root_oid
+			FROM pg_inherits
+			JOIN pg_class child ON pg_inherits.inhrelid = child.oid
+			JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+			WHERE parent.relkind = 'p'
+			  AND NOT EXISTS (
+			      SELECT 1 FROM pg_inherits pi2
+			      JOIN pg_class gp ON pi2.inhparent = gp.oid
+			      WHERE pi2.inhrelid = parent.oid AND gp.relkind = 'p'
+			  )
+
+			UNION ALL
+
+			-- recurse: sub-partitions point to the same root
+			SELECT
+				child.oid,
+				pt.root_oid
+			FROM pg_inherits
+			JOIN pg_class child ON pg_inherits.inhrelid = child.oid
+			JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+			JOIN partition_tree pt ON pt.partition_oid = parent.oid
+			WHERE parent.relkind = 'p'
+		)
 		SELECT
-			child_ns.nspname || '.' || child.relname,
-			parent_ns.nspname || '.' || parent.relname
-		FROM pg_inherits
-		JOIN pg_class child ON pg_inherits.inhrelid = child.oid
-		JOIN pg_namespace child_ns ON child.relnamespace = child_ns.oid
-		JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
-		JOIN pg_namespace parent_ns ON parent.relnamespace = parent_ns.oid
-		WHERE parent.relkind = 'p'
+			pns.nspname || '.' || pc.relname,
+			rns.nspname || '.' || rc.relname
+		FROM partition_tree
+		JOIN pg_class pc ON partition_tree.partition_oid = pc.oid
+		JOIN pg_namespace pns ON pc.relnamespace = pns.oid
+		JOIN pg_class rc ON partition_tree.root_oid = rc.oid
+		JOIN pg_namespace rns ON rc.relnamespace = rns.oid
 	`
 
 	rows, err := db.Query(query)
@@ -172,11 +198,11 @@ func getPartitionParents(db *sql.DB) (map[string]string, error) {
 
 	m := make(map[string]string)
 	for rows.Next() {
-		var partition, parent string
-		if err := rows.Scan(&partition, &parent); err != nil {
+		var partition, root string
+		if err := rows.Scan(&partition, &root); err != nil {
 			return nil, err
 		}
-		m[partition] = parent
+		m[partition] = root
 	}
 
 	return m, rows.Err()
