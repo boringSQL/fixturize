@@ -319,6 +319,12 @@ func getForeignKeys(db *sql.DB, schemaName, tableName string) ([]*ForeignKeyInfo
 		WHERE c.contype = 'f'
 		  AND ns.nspname = $1
 		  AND cl.relname = $2
+		  AND NOT EXISTS (
+		      SELECT 1 FROM pg_inherits
+		      JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+		      WHERE pg_inherits.inhrelid = c.confrelid
+		        AND parent.relkind = 'p'
+		  )
 		ORDER BY c.conname, cols.ord
 	`
 
