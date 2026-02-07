@@ -49,6 +49,11 @@ func IntrospectSchema(db *sql.DB) (*DatabaseSchema, error) {
 		return nil, fmt.Errorf("failed to get tables: %w", err)
 	}
 
+	partitionMap, err := getPartitionParents(db)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get partition map: %w", err)
+	}
+
 	for _, qualifiedName := range tables {
 		schemaName, tableName := parseTableName(qualifiedName)
 
@@ -80,6 +85,14 @@ func IntrospectSchema(db *sql.DB) (*DatabaseSchema, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to get foreign keys for table '%s': %w", qualifiedName, err)
 		}
+
+		// Make sure FK references to partitions back to the parent table
+		for _, fk := range foreignKeys {
+			if parent, ok := partitionMap[fk.ReferencedTable]; ok {
+				fk.ReferencedTable = parent
+			}
+		}
+
 		tableInfo.ForeignKeys = foreignKeys
 
 		for _, fk := range foreignKeys {
@@ -108,9 +121,15 @@ func IntrospectSchema(db *sql.DB) (*DatabaseSchema, error) {
 func getTables(db *sql.DB) ([]string, error) {
 	query := `
 		SELECT table_schema, table_name
-		FROM information_schema.tables
+		FROM information_schema.tables t
 		WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-		  AND table_type = 'BASE TABLE'
+		  AND table_type IN ('BASE TABLE', 'PARTITIONED TABLE')
+		  AND NOT EXISTS (
+		      SELECT 1 FROM pg_inherits
+		      JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+		      WHERE pg_inherits.inhrelid = (quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass
+		        AND parent.relkind = 'p'
+		  )
 		ORDER BY table_schema, table_name
 	`
 
@@ -130,6 +149,37 @@ func getTables(db *sql.DB) ([]string, error) {
 	}
 
 	return tables, rows.Err()
+}
+
+func getPartitionParents(db *sql.DB) (map[string]string, error) {
+	query := `
+		SELECT
+			child_ns.nspname || '.' || child.relname,
+			parent_ns.nspname || '.' || parent.relname
+		FROM pg_inherits
+		JOIN pg_class child ON pg_inherits.inhrelid = child.oid
+		JOIN pg_namespace child_ns ON child.relnamespace = child_ns.oid
+		JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+		JOIN pg_namespace parent_ns ON parent.relnamespace = parent_ns.oid
+		WHERE parent.relkind = 'p'
+	`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	m := make(map[string]string)
+	for rows.Next() {
+		var partition, parent string
+		if err := rows.Scan(&partition, &parent); err != nil {
+			return nil, err
+		}
+		m[partition] = parent
+	}
+
+	return m, rows.Err()
 }
 
 func parseTableName(name string) (schema, table string) {
