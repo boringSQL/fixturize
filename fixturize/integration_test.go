@@ -453,3 +453,242 @@ func TestIdentityColumns(t *testing.T) {
 		t.Errorf("applied action=%q, want 'created_workspace'", action)
 	}
 }
+
+func TestSelfReferencingFK(t *testing.T) {
+	resetDB(t, testDB)
+	seedCategories(t, testDB)
+
+	// Extract starting from root category — should follow self-referencing FK
+	// to discover the full hierarchy: Root → Child → Grandchild
+	result := extractFixture(t, testDB, &ExtractOptions{
+		Root:   "categories WHERE id = 1",
+		Schema: "public",
+	})
+	fixture := result.Fixture
+
+	cats := fixture.Tables["public.categories"]
+	if cats == nil {
+		t.Fatal("missing public.categories in fixture")
+	}
+	if len(cats.Rows) != 3 {
+		t.Fatalf("expected 3 category rows (Root+Child+Grandchild), got %d", len(cats.Rows))
+	}
+
+	// Verify all three names are present
+	nameIdx := colIndex(cats, "name")
+	if nameIdx < 0 {
+		t.Fatal("no name column in categories")
+	}
+	names := make(map[string]bool)
+	for _, row := range cats.Rows {
+		names[fmt.Sprintf("%v", row[nameIdx])] = true
+	}
+	for _, expected := range []string{"Root", "Child", "Grandchild"} {
+		if !names[expected] {
+			t.Errorf("missing category %q in fixture, got: %v", expected, names)
+		}
+	}
+
+	// Round-trip: apply to empty DB and verify hierarchy is preserved
+	resetDB(t, testDB)
+	applyFixture(t, testDB, fixture, &ApplyOptions{Force: true, SyncSequences: true})
+
+	if c := rowCount(t, testDB, "categories"); c != 3 {
+		t.Fatalf("expected 3 categories after apply, got %d", c)
+	}
+
+	// Verify parent_id relationships
+	var parentID *int
+	err := testDB.QueryRow("SELECT parent_id FROM categories WHERE name = 'Root'").Scan(&parentID)
+	if err != nil {
+		t.Fatalf("query Root category: %v", err)
+	}
+	if parentID != nil {
+		t.Errorf("Root parent_id should be NULL, got %v", *parentID)
+	}
+
+	var childParent int
+	err = testDB.QueryRow("SELECT parent_id FROM categories WHERE name = 'Child'").Scan(&childParent)
+	if err != nil {
+		t.Fatalf("query Child category: %v", err)
+	}
+
+	var rootID int
+	if err := testDB.QueryRow("SELECT id FROM categories WHERE name = 'Root'").Scan(&rootID); err != nil {
+		t.Fatalf("query Root id: %v", err)
+	}
+	if childParent != rootID {
+		t.Errorf("Child.parent_id=%d, want Root.id=%d", childParent, rootID)
+	}
+}
+
+func TestCircularFKRoundTrip(t *testing.T) {
+	resetDB(t, testDB)
+	seedCircular(t, testDB)
+
+	result := extractFixture(t, testDB, &ExtractOptions{
+		Root:   "departments WHERE id = 1",
+		Schema: "public",
+	})
+	fixture := result.Fixture
+
+	depts := fixture.Tables["public.departments"]
+	if depts == nil {
+		t.Fatal("missing public.departments in fixture")
+	}
+	if len(depts.Rows) != 1 {
+		t.Errorf("expected 1 department row, got %d", len(depts.Rows))
+	}
+
+	emps := fixture.Tables["public.employees"]
+	if emps == nil {
+		t.Fatal("missing public.employees in fixture")
+	}
+	if len(emps.Rows) != 1 {
+		t.Errorf("expected 1 employee row, got %d", len(emps.Rows))
+	}
+
+	// Verify the circular references are captured
+	leadIdx := colIndex(depts, "lead_employee_id")
+	if leadIdx < 0 {
+		t.Fatal("no lead_employee_id column in departments")
+	}
+	leadVal := fmt.Sprintf("%v", depts.Rows[0][leadIdx])
+	if leadVal == "<nil>" {
+		t.Error("department lead_employee_id should not be NULL")
+	}
+
+	deptIdx := colIndex(emps, "department_id")
+	if deptIdx < 0 {
+		t.Fatal("no department_id column in employees")
+	}
+	deptVal := fmt.Sprintf("%v", emps.Rows[0][deptIdx])
+	if deptVal == "<nil>" {
+		t.Error("employee department_id should not be NULL")
+	}
+
+	// Round-trip: apply with DEFERRABLE constraints
+	resetDB(t, testDB)
+	applyFixture(t, testDB, fixture, &ApplyOptions{Force: true, SyncSequences: true})
+
+	if c := rowCount(t, testDB, "departments"); c != 1 {
+		t.Fatalf("expected 1 department after apply, got %d", c)
+	}
+	if c := rowCount(t, testDB, "employees"); c != 1 {
+		t.Fatalf("expected 1 employee after apply, got %d", c)
+	}
+
+	// Verify circular references survived the round-trip
+	var appliedLead, appliedDept int
+	err := testDB.QueryRow("SELECT lead_employee_id FROM departments WHERE id = 1").Scan(&appliedLead)
+	if err != nil {
+		t.Fatalf("query applied department lead: %v", err)
+	}
+	err = testDB.QueryRow("SELECT department_id FROM employees WHERE id = 1").Scan(&appliedDept)
+	if err != nil {
+		t.Fatalf("query applied employee dept: %v", err)
+	}
+	if appliedLead != 1 {
+		t.Errorf("department lead_employee_id=%d, want 1", appliedLead)
+	}
+	if appliedDept != 1 {
+		t.Errorf("employee department_id=%d, want 1", appliedDept)
+	}
+}
+
+func TestFullRoundTrip(t *testing.T) {
+	resetDB(t, testDB)
+	seedAll(t, testDB)
+
+	result := extractFixture(t, testDB, &ExtractOptions{
+		Root:   "organizations WHERE id = 1",
+		Schema: "public",
+	})
+	fixture := result.Fixture
+
+	// Verify extracted tables and row counts
+	expectedCounts := map[string]int{
+		"public.organizations": 1,
+		"public.users":         2,
+		"public.projects":      2,
+		"public.audit_logs":    1,
+	}
+	for table, wantCount := range expectedCounts {
+		ft := fixture.Tables[table]
+		if ft == nil {
+			t.Errorf("missing %s in fixture", table)
+			continue
+		}
+		if len(ft.Rows) != wantCount {
+			t.Errorf("%s: got %d rows, want %d", table, len(ft.Rows), wantCount)
+		}
+	}
+
+	// Serialize to JSON and deserialize to test the full pipeline
+	jsonData, err := fixture.ToJSON()
+	if err != nil {
+		t.Fatalf("ToJSON: %v", err)
+	}
+	reloaded, err := LoadFixture(jsonData)
+	if err != nil {
+		t.Fatalf("LoadFixture: %v", err)
+	}
+
+	// Apply the reloaded fixture to a clean database
+	resetDB(t, testDB)
+	applyFixture(t, testDB, reloaded, &ApplyOptions{Force: true, SyncSequences: true})
+
+	// Verify row counts match
+	for table, wantCount := range expectedCounts {
+		_, shortTable := parseTableName(table)
+		if c := rowCount(t, testDB, shortTable); c != wantCount {
+			t.Errorf("%s: got %d rows after apply, want %d", table, c, wantCount)
+		}
+	}
+
+	// Verify FK integrity — all user.org_id values exist in organizations
+	var badFKCount int
+	err = testDB.QueryRow(`
+		SELECT COUNT(*) FROM users u
+		LEFT JOIN organizations o ON o.id = u.org_id
+		WHERE o.id IS NULL
+	`).Scan(&badFKCount)
+	if err != nil {
+		t.Fatalf("FK integrity check: %v", err)
+	}
+	if badFKCount > 0 {
+		t.Errorf("found %d users with dangling org_id FK", badFKCount)
+	}
+
+	// Verify specific data values survived the round-trip
+	var orgName string
+	if err := testDB.QueryRow("SELECT name FROM organizations WHERE id = 1").Scan(&orgName); err != nil {
+		t.Fatalf("query org name: %v", err)
+	}
+	if orgName != "Acme Corp" {
+		t.Errorf("org name=%q, want 'Acme Corp'", orgName)
+	}
+
+	var userEmail string
+	if err := testDB.QueryRow("SELECT email FROM users WHERE id = 1").Scan(&userEmail); err != nil {
+		t.Fatalf("query user email: %v", err)
+	}
+	if userEmail != "alice@acme.com" {
+		t.Errorf("user email=%q, want 'alice@acme.com'", userEmail)
+	}
+
+	// Verify org 2 data was NOT applied
+	if c := rowCount(t, testDB, "organizations"); c != 1 {
+		t.Errorf("expected exactly 1 organization, got %d", c)
+	}
+
+	// Verify sequences were synced — next insert should not conflict
+	var newID int
+	err = testDB.QueryRow("INSERT INTO users (org_id, email) VALUES (1, 'new@acme.com') RETURNING id").Scan(&newID)
+	if err != nil {
+		t.Fatalf("insert after sequence sync failed: %v", err)
+	}
+	if newID <= 2 {
+		t.Errorf("new user id=%d, expected > 2 (sequence should be synced past existing ids)", newID)
+	}
+}
