@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/testcontainers/testcontainers-go"
@@ -65,6 +66,68 @@ CREATE TABLE audit_logs (
     org_id INT NOT NULL REFERENCES organizations(id),
     action TEXT NOT NULL
 );
+
+CREATE TABLE events (
+    id SERIAL,
+    org_id INT NOT NULL REFERENCES organizations(id),
+    event_date DATE NOT NULL,
+    payload TEXT,
+    PRIMARY KEY (id, event_date)
+) PARTITION BY RANGE (event_date);
+
+CREATE TABLE events_2024 PARTITION OF events
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE events_2025 PARTITION OF events
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+CREATE TABLE tasks (
+    id SERIAL PRIMARY KEY,
+    org_id INT NOT NULL REFERENCES organizations(id),
+    title TEXT NOT NULL
+) PARTITION BY HASH (id);
+
+CREATE TABLE tasks_hash_0 PARTITION OF tasks FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+CREATE TABLE tasks_hash_1 PARTITION OF tasks FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+CREATE TABLE tasks_hash_2 PARTITION OF tasks FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+CREATE TABLE tasks_hash_3 PARTITION OF tasks FOR VALUES WITH (MODULUS 4, REMAINDER 3);
+
+CREATE TABLE task_comments (
+    id SERIAL PRIMARY KEY,
+    task_id INT NOT NULL REFERENCES tasks(id),
+    body TEXT NOT NULL
+);
+
+CREATE TABLE metrics (
+    id SERIAL,
+    org_id INT NOT NULL REFERENCES organizations(id),
+    recorded_at DATE NOT NULL,
+    value INT NOT NULL,
+    PRIMARY KEY (id, recorded_at)
+) PARTITION BY RANGE (recorded_at);
+
+CREATE TABLE metrics_2024 PARTITION OF metrics
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')
+    PARTITION BY HASH (id);
+CREATE TABLE metrics_2024_hash_0 PARTITION OF metrics_2024 FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+CREATE TABLE metrics_2024_hash_1 PARTITION OF metrics_2024 FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+
+CREATE TABLE metrics_2025 PARTITION OF metrics
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+CREATE TABLE workspace_projects (
+    workspace_id INT NOT NULL,
+    project_id INT NOT NULL,
+    name TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, project_id)
+);
+
+CREATE TABLE project_assignments (
+    id SERIAL PRIMARY KEY,
+    workspace_id INT NOT NULL,
+    project_id INT NOT NULL,
+    assignee TEXT NOT NULL,
+    FOREIGN KEY (workspace_id, project_id) REFERENCES workspace_projects(workspace_id, project_id)
+);
 `
 
 func TestMain(m *testing.M) {
@@ -117,7 +180,9 @@ func TestMain(m *testing.M) {
 
 var allTables = []string{
 	"audit_logs", "categories", "departments", "employees",
-	"organizations", "projects", "users",
+	"events", "metrics", "organizations", "project_assignments",
+	"projects", "task_comments", "tasks", "users",
+	"workspace_projects",
 }
 
 func resetDB(t *testing.T, db *sql.DB) {
@@ -146,6 +211,14 @@ func seedAll(t *testing.T, db *sql.DB) {
 		`SELECT setval('departments_id_seq', 1)`,
 		`SELECT setval('employees_id_seq', 1)`,
 		`INSERT INTO audit_logs (org_id, action) VALUES (1, 'created_workspace')`,
+		`INSERT INTO events (id, org_id, event_date, payload) VALUES (1, 1, '2024-06-15', 'event_a'), (2, 1, '2025-03-20', 'event_b'), (3, 2, '2024-11-01', 'event_c')`,
+		`SELECT setval('events_id_seq', 3)`,
+		`INSERT INTO tasks (id, org_id, title) VALUES (1, 1, 'Task A'), (2, 1, 'Task B'), (3, 2, 'Task C')`,
+		`SELECT setval('tasks_id_seq', 3)`,
+		`INSERT INTO task_comments (id, task_id, body) VALUES (1, 1, 'comment on A'), (2, 2, 'comment on B'), (3, 3, 'comment on C')`,
+		`SELECT setval('task_comments_id_seq', 3)`,
+		`INSERT INTO metrics (id, org_id, recorded_at, value) VALUES (1, 1, '2024-03-15', 100), (2, 1, '2024-09-20', 200), (3, 1, '2025-02-10', 300), (4, 2, '2024-06-01', 400)`,
+		`SELECT setval('metrics_id_seq', 4)`,
 	}
 	for _, q := range queries {
 		if _, err := db.Exec(q); err != nil {
@@ -690,5 +763,288 @@ func TestFullRoundTrip(t *testing.T) {
 	}
 	if newID <= 2 {
 		t.Errorf("new user id=%d, expected > 2 (sequence should be synced past existing ids)", newID)
+	}
+}
+
+func TestPartitionedTable(t *testing.T) {
+	resetDB(t, testDB)
+	seedAll(t, testDB)
+
+	schema, err := IntrospectSchema(testDB)
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+
+	// Range-partitioned: parent visible, partitions hidden
+	if !schema.HasTable("public.events") {
+		t.Fatal("partitioned parent table 'events' should be visible in schema")
+	}
+	if schema.HasTable("public.events_2024") {
+		t.Error("partition 'events_2024' should NOT appear as a separate table")
+	}
+	if schema.HasTable("public.events_2025") {
+		t.Error("partition 'events_2025' should NOT appear as a separate table")
+	}
+
+	// Hash-partitioned: parent visible, partitions hidden
+	if !schema.HasTable("public.tasks") {
+		t.Fatal("partitioned parent table 'tasks' should be visible in schema")
+	}
+	for i := 0; i < 4; i++ {
+		name := fmt.Sprintf("public.tasks_hash_%d", i)
+		if schema.HasTable(name) {
+			t.Errorf("partition %q should NOT appear as a separate table", name)
+		}
+	}
+
+	// FK on task_comments should reference 'tasks' (parent), not a partition
+	tcInfo, err := schema.GetTable("public.task_comments")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fk := range tcInfo.ForeignKeys {
+		if fk.ColumnName == "task_id" && fk.ReferencedTable != "public.tasks" {
+			t.Errorf("task_comments.task_id FK references %q, want 'public.tasks'", fk.ReferencedTable)
+		}
+	}
+
+	// Extract org 1 — should pull events and tasks across partitions
+	result := extractFixture(t, testDB, &ExtractOptions{
+		Root:   "organizations WHERE id = 1",
+		Schema: "public",
+	})
+	fixture := result.Fixture
+
+	// Range-partitioned events: 2 rows across 2 partitions
+	events := fixture.Tables["public.events"]
+	if events == nil {
+		t.Fatal("missing public.events in fixture")
+	}
+	if len(events.Rows) != 2 {
+		t.Errorf("expected 2 event rows for org 1, got %d", len(events.Rows))
+	}
+
+	payloadIdx := colIndex(events, "payload")
+	if payloadIdx < 0 {
+		t.Fatal("no payload column in events")
+	}
+	payloads := make(map[string]bool)
+	for _, row := range events.Rows {
+		payloads[fmt.Sprintf("%v", row[payloadIdx])] = true
+	}
+	if !payloads["event_a"] || !payloads["event_b"] {
+		t.Errorf("expected event_a and event_b, got: %v", payloads)
+	}
+	if payloads["event_c"] {
+		t.Error("event_c (org 2) should not be in fixture")
+	}
+
+	// Hash-partitioned tasks: 2 rows for org 1, spread across hash partitions
+	tasks := fixture.Tables["public.tasks"]
+	if tasks == nil {
+		t.Fatal("missing public.tasks in fixture")
+	}
+	if len(tasks.Rows) != 2 {
+		t.Errorf("expected 2 task rows for org 1, got %d", len(tasks.Rows))
+	}
+
+	// task_comments should be extracted as children of the parent table
+	comments := fixture.Tables["public.task_comments"]
+	if comments == nil {
+		t.Fatal("missing public.task_comments in fixture")
+	}
+	if len(comments.Rows) != 2 {
+		t.Errorf("expected 2 task_comments for org 1 tasks, got %d", len(comments.Rows))
+	}
+
+	// No partition tables should appear in fixture
+	for tableName := range fixture.Tables {
+		if strings.Contains(tableName, "hash_") || strings.Contains(tableName, "_2024") || strings.Contains(tableName, "_2025") {
+			t.Errorf("partition %q should not appear in fixture", tableName)
+		}
+	}
+
+	// Round-trip
+	resetDB(t, testDB)
+	applyFixture(t, testDB, fixture, &ApplyOptions{Force: true, SyncSequences: true})
+
+	if c := rowCount(t, testDB, "events"); c != 2 {
+		t.Errorf("expected 2 events after apply, got %d", c)
+	}
+	if c := rowCount(t, testDB, "tasks"); c != 2 {
+		t.Errorf("expected 2 tasks after apply, got %d", c)
+	}
+	if c := rowCount(t, testDB, "task_comments"); c != 2 {
+		t.Errorf("expected 2 task_comments after apply, got %d", c)
+	}
+
+	// Verify FK from task_comments -> tasks survived round-trip
+	var badFK int
+	err = testDB.QueryRow(`
+		SELECT COUNT(*) FROM task_comments tc
+		LEFT JOIN tasks t ON t.id = tc.task_id
+		WHERE t.id IS NULL
+	`).Scan(&badFK)
+	if err != nil {
+		t.Fatalf("FK check: %v", err)
+	}
+	if badFK > 0 {
+		t.Errorf("found %d task_comments with dangling task_id FK", badFK)
+	}
+}
+
+func TestNestedPartitions(t *testing.T) {
+	resetDB(t, testDB)
+	seedAll(t, testDB)
+
+	schema, err := IntrospectSchema(testDB)
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+
+	// Only the root partitioned table should be visible
+	if !schema.HasTable("public.metrics") {
+		t.Fatal("root partitioned table 'metrics' should be visible")
+	}
+	for _, hidden := range []string{
+		"public.metrics_2024", "public.metrics_2025",
+		"public.metrics_2024_hash_0", "public.metrics_2024_hash_1",
+	} {
+		if schema.HasTable(hidden) {
+			t.Errorf("partition %q should NOT appear as a separate table", hidden)
+		}
+	}
+
+	// Verify partition map resolves nested partitions to root
+	partMap, err := getPartitionParents(testDB)
+	if err != nil {
+		t.Fatalf("getPartitionParents: %v", err)
+	}
+	// Sub-partitions should map to the root, not the intermediate
+	for _, leaf := range []string{"public.metrics_2024_hash_0", "public.metrics_2024_hash_1"} {
+		if root, ok := partMap[leaf]; !ok {
+			t.Errorf("partition map missing %q", leaf)
+		} else if root != "public.metrics" {
+			t.Errorf("partition %q maps to %q, want 'public.metrics'", leaf, root)
+		}
+	}
+	// Intermediate partition should also map to root
+	if root, ok := partMap["public.metrics_2024"]; !ok {
+		t.Errorf("partition map missing 'public.metrics_2024'")
+	} else if root != "public.metrics" {
+		t.Errorf("metrics_2024 maps to %q, want 'public.metrics'", root)
+	}
+
+	// Extract org 1 — should get 3 metrics across nested partitions
+	result := extractFixture(t, testDB, &ExtractOptions{
+		Root:   "organizations WHERE id = 1",
+		Schema: "public",
+	})
+	fixture := result.Fixture
+
+	metrics := fixture.Tables["public.metrics"]
+	if metrics == nil {
+		t.Fatal("missing public.metrics in fixture")
+	}
+	if len(metrics.Rows) != 3 {
+		t.Errorf("expected 3 metric rows for org 1, got %d", len(metrics.Rows))
+	}
+
+	// No nested partitions in fixture
+	for tableName := range fixture.Tables {
+		if strings.Contains(tableName, "metrics_") {
+			t.Errorf("partition %q should not appear in fixture", tableName)
+		}
+	}
+
+	// Round-trip
+	resetDB(t, testDB)
+	applyFixture(t, testDB, fixture, &ApplyOptions{Force: true, SyncSequences: true})
+
+	if c := rowCount(t, testDB, "metrics"); c != 3 {
+		t.Errorf("expected 3 metrics after apply, got %d", c)
+	}
+}
+
+func TestCompositeForeignKey(t *testing.T) {
+	resetDB(t, testDB)
+
+	// Seed workspace_projects and project_assignments
+	queries := []string{
+		`INSERT INTO workspace_projects (workspace_id, project_id, name) VALUES (10, 1, 'WP-A'), (10, 2, 'WP-B')`,
+		`INSERT INTO project_assignments (id, workspace_id, project_id, assignee) VALUES (1, 10, 1, 'Alice'), (2, 10, 2, 'Bob')`,
+		`SELECT setval('project_assignments_id_seq', 2)`,
+	}
+	for _, q := range queries {
+		if _, err := testDB.Exec(q); err != nil {
+			t.Fatalf("seed: %s\n  %v", q, err)
+		}
+	}
+
+	schema, err := IntrospectSchema(testDB)
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+
+	// Verify composite FK has correct column pairings (not a cross-product)
+	paInfo, err := schema.GetTable("public.project_assignments")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should have exactly 2 FK entries (one per column in the composite FK)
+	if len(paInfo.ForeignKeys) != 2 {
+		t.Fatalf("expected 2 FK entries for composite FK, got %d", len(paInfo.ForeignKeys))
+	}
+
+	// Build a map of local_col -> referenced_col for verification
+	fkPairs := make(map[string]string)
+	for _, fk := range paInfo.ForeignKeys {
+		fkPairs[fk.ColumnName] = fk.ReferencedColumn
+		if fk.ReferencedTable != "public.workspace_projects" {
+			t.Errorf("FK references %q, want 'public.workspace_projects'", fk.ReferencedTable)
+		}
+	}
+
+	// workspace_id -> workspace_id, project_id -> project_id (not cross-product)
+	if fkPairs["workspace_id"] != "workspace_id" {
+		t.Errorf("workspace_id FK maps to %q, want 'workspace_id'", fkPairs["workspace_id"])
+	}
+	if fkPairs["project_id"] != "project_id" {
+		t.Errorf("project_id FK maps to %q, want 'project_id'", fkPairs["project_id"])
+	}
+
+	// Extract from workspace_projects — should pull assignments as children
+	result := extractFixture(t, testDB, &ExtractOptions{
+		Root:   "workspace_projects WHERE workspace_id = 10",
+		Schema: "public",
+	})
+	fixture := result.Fixture
+
+	wp := fixture.Tables["public.workspace_projects"]
+	if wp == nil {
+		t.Fatal("missing public.workspace_projects in fixture")
+	}
+	if len(wp.Rows) != 2 {
+		t.Errorf("expected 2 workspace_projects rows, got %d", len(wp.Rows))
+	}
+
+	pa := fixture.Tables["public.project_assignments"]
+	if pa == nil {
+		t.Fatal("missing public.project_assignments in fixture")
+	}
+	if len(pa.Rows) != 2 {
+		t.Errorf("expected 2 project_assignments rows, got %d", len(pa.Rows))
+	}
+
+	// Round-trip
+	resetDB(t, testDB)
+	applyFixture(t, testDB, fixture, &ApplyOptions{Force: true, SyncSequences: true})
+
+	if c := rowCount(t, testDB, "workspace_projects"); c != 2 {
+		t.Errorf("expected 2 workspace_projects after apply, got %d", c)
+	}
+	if c := rowCount(t, testDB, "project_assignments"); c != 2 {
+		t.Errorf("expected 2 project_assignments after apply, got %d", c)
 	}
 }
