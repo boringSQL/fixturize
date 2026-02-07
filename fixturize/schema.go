@@ -274,23 +274,29 @@ func getPrimaryKeys(db *sql.DB, schemaName, tableName string) ([]string, error) 
 func getForeignKeys(db *sql.DB, schemaName, tableName string) ([]*ForeignKeyInfo, error) {
 	query := `
 		SELECT
-			tc.constraint_name,
-			kcu.column_name,
-			ccu.table_schema AS referenced_schema,
-			ccu.table_name AS referenced_table,
-			ccu.column_name AS referenced_column
-		FROM information_schema.table_constraints AS tc
-		JOIN information_schema.key_column_usage AS kcu
-		  ON tc.constraint_name = kcu.constraint_name
-		  AND tc.table_schema = kcu.table_schema
-		JOIN information_schema.constraint_column_usage AS ccu
-		  ON ccu.constraint_name = tc.constraint_name
-		WHERE tc.constraint_type = 'FOREIGN KEY'
-		  AND tc.table_name = $1
-		  AND tc.table_schema = $2
+			c.conname,
+			a_local.attname,
+			ns_ref.nspname,
+			cl_ref.relname,
+			a_ref.attname
+		FROM pg_constraint c
+		JOIN pg_class cl ON c.conrelid = cl.oid
+		JOIN pg_namespace ns ON cl.relnamespace = ns.oid
+		JOIN pg_class cl_ref ON c.confrelid = cl_ref.oid
+		JOIN pg_namespace ns_ref ON cl_ref.relnamespace = ns_ref.oid
+		CROSS JOIN LATERAL unnest(c.conkey, c.confkey)
+			WITH ORDINALITY AS cols(local_col, ref_col, ord)
+		JOIN pg_attribute a_local
+			ON a_local.attrelid = c.conrelid AND a_local.attnum = cols.local_col
+		JOIN pg_attribute a_ref
+			ON a_ref.attrelid = c.confrelid AND a_ref.attnum = cols.ref_col
+		WHERE c.contype = 'f'
+		  AND ns.nspname = $1
+		  AND cl.relname = $2
+		ORDER BY c.conname, cols.ord
 	`
 
-	rows, err := db.Query(query, tableName, schemaName)
+	rows, err := db.Query(query, schemaName, tableName)
 	if err != nil {
 		return nil, err
 	}
