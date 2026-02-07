@@ -56,6 +56,7 @@ Examples:
 	extractMask             []string
 	extractStatementTimeout int
 	extractDryRun           bool
+	extractVerbose          bool
 )
 
 func init() {
@@ -72,6 +73,7 @@ func init() {
 	extractCmd.Flags().StringArrayVar(&extractMask, "mask", nil, "Mask column with SQL expression (table.column=expr, repeatable)")
 	extractCmd.Flags().IntVar(&extractStatementTimeout, "statement-timeout", 0, "Per-statement timeout in seconds")
 	extractCmd.Flags().BoolVar(&extractDryRun, "dry-run", false, "Print JSON to stdout, don't write file")
+	extractCmd.Flags().BoolVarP(&extractVerbose, "verbose", "v", false, "Print FK edges and lookup counts during traversal")
 }
 
 func expandEnvVars(s string) string {
@@ -110,6 +112,7 @@ func runExtract(cmd *cobra.Command, args []string) error {
 		Mask:             masks,
 		StatementTimeout: statementTimeout,
 		DryRun:           extractDryRun,
+		Verbose:          extractVerbose,
 	}
 
 	// Delete previous output before extraction so stale data can't persist on failure

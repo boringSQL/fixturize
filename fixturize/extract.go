@@ -2,11 +2,9 @@ package fixturize
 
 import (
 	"database/sql"
-	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 )
 
 type (
@@ -22,6 +20,7 @@ type (
 		Mask             []string
 		StatementTimeout int
 		DryRun           bool
+		Verbose          bool
 	}
 
 	ExtractResult struct {
@@ -51,12 +50,15 @@ type (
 		columnOrders    map[string][]string
 		warnings        []string
 		warnedParentFKs map[string]bool
+		downwardTables  map[string]bool // tables we found by going downward (root + children)
+		limitReached    map[string]bool // tables where we already hit --limit so they are not queried again
 	}
 
 	fkEdge struct {
-		ChildTable   string
-		ChildColumn  string
-		ParentColumn string
+		ConstraintName string
+		ChildTable     string
+		ChildColumn    string
+		ParentColumn   string
 	}
 )
 
@@ -80,6 +82,8 @@ func NewExtractor(db *sql.DB, options *ExtractOptions) *Extractor {
 		masks:           make(map[string]map[string]string),
 		columnOrders:    make(map[string][]string),
 		warnedParentFKs: make(map[string]bool),
+		downwardTables:  make(map[string]bool),
+		limitReached:    make(map[string]bool),
 	}
 }
 
@@ -147,6 +151,7 @@ func (e *Extractor) Extract() (*ExtractResult, error) {
 	if err := e.extractRootRows(rootTable, clause); err != nil {
 		return nil, fmt.Errorf("root query failed:\n  %s\n  %w", rootQuery, err)
 	}
+	e.downwardTables[rootTable] = true
 
 	rootCount := len(e.collected[rootTable])
 	if rootCount == 0 {
@@ -163,21 +168,23 @@ func (e *Extractor) Extract() (*ExtractResult, error) {
 		if err := e.extractAllRows(tableName); err != nil {
 			return nil, fmt.Errorf("failed to extract included table %q: %w", incl, err)
 		}
+		e.downwardTables[tableName] = true
 		fmt.Printf("  + %s... %d row(s) (included)\n", shortName(tableName), len(e.collected[tableName]))
 	}
 
+	// 1st pass: walk all child edges from the root; this discovers
+	// the full subgraph of data that "belongs" to the root entity.
+	if _, err := e.extractChildren(); err != nil {
+		return nil, fmt.Errorf("failed to extract children: %w", err)
+	}
+
+	// 2nd pass: fetch any parent rows needed to maintain FK integrity.
 	for iteration := 0; iteration < maxTraversalIterations; iteration++ {
 		newParents, err := e.extractParents()
 		if err != nil {
 			return nil, fmt.Errorf("failed to extract parents: %w", err)
 		}
-
-		newChildren, err := e.extractChildren(rootTable)
-		if err != nil {
-			return nil, fmt.Errorf("failed to extract children: %w", err)
-		}
-
-		if !newParents && !newChildren {
+		if !newParents {
 			break
 		}
 	}
@@ -351,451 +358,6 @@ func (e *Extractor) getOrderedColumns(tableName string) ([]string, error) {
 	return cols, nil
 }
 
-func (e *Extractor) buildInvertedGraph() {
-	for _, tableName := range e.schema.GetTables() {
-		tableInfo, _ := e.schema.GetTable(tableName)
-		for _, fk := range tableInfo.ForeignKeys {
-			parentTable := fk.ReferencedTable
-			e.invertedGraph[parentTable] = append(e.invertedGraph[parentTable], fkEdge{
-				ChildTable:   tableName,
-				ChildColumn:  fk.ColumnName,
-				ParentColumn: fk.ReferencedColumn,
-			})
-		}
-	}
-}
-
-func (e *Extractor) loadGeneratedColumns() error {
-	query := `
-		SELECT table_schema || '.' || table_name, column_name,
-		       is_generated, identity_generation
-		FROM information_schema.columns
-		WHERE (is_generated = 'ALWAYS' OR identity_generation = 'ALWAYS')
-		  AND table_schema NOT IN ('pg_catalog', 'information_schema')
-	`
-
-	rows, err := e.tx.Query(query)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var tableName, colName, isGenerated string
-		var identityGen *string
-		if err := rows.Scan(&tableName, &colName, &isGenerated, &identityGen); err != nil {
-			return err
-		}
-
-		// there's a problem with computed columns and how they need to be treated
-		// - computed colums (GENERATED ALWAYS AS expr STORED) are exlcuded from
-		//   the extraction.
-		// - identity columns (GENERATED ... AS IDENTITY) are kept to maintain the
-		//   referential integrity; apply side uses OVERRIDE SYTEM VALUE
-		if isGenerated == "ALWAYS" {
-			if _, ok := e.generatedCols[tableName]; !ok {
-				e.generatedCols[tableName] = make(map[string]bool)
-			}
-			e.generatedCols[tableName][colName] = true
-		}
-
-		// track identity tables
-		if identityGen != nil && *identityGen == "ALWAYS" {
-			e.identityTables[tableName] = true
-		}
-	}
-
-	return rows.Err()
-}
-
-func (e *Extractor) extractRootRows(table, clause string) error {
-	cols, err := e.selectColumns(table)
-	if err != nil {
-		return err
-	}
-	query := fmt.Sprintf("SELECT %s FROM %s", cols, QuoteQualifiedTable(table))
-	if clause != "" {
-		query += " " + clause
-	}
-
-	rows, err := e.tx.Query(query)
-	if err != nil {
-		return fmt.Errorf("root query failed: %w", err)
-	}
-	defer rows.Close()
-
-	return e.collectRows(table, rows)
-}
-
-func (e *Extractor) extractAllRows(table string) error {
-	cols, err := e.selectColumns(table)
-	if err != nil {
-		return err
-	}
-	query := fmt.Sprintf("SELECT %s FROM %s", cols, QuoteQualifiedTable(table))
-
-	rows, err := e.tx.Query(query)
-	if err != nil {
-		return fmt.Errorf("query failed for %s: %w", table, err)
-	}
-	defer rows.Close()
-
-	return e.collectRows(table, rows)
-}
-
-func (e *Extractor) extractParents() (bool, error) {
-	foundNew := false
-
-	for tableName, tableRows := range e.collected {
-		tableInfo, err := e.schema.GetTable(tableName)
-		if err != nil {
-			continue
-		}
-
-		for _, fk := range tableInfo.ForeignKeys {
-			parentTable := fk.ReferencedTable
-
-			if e.excludeSet[shortName(parentTable)] || e.excludeSet[parentTable] {
-				e.warnExcludedParent(parentTable, tableName)
-				continue
-			}
-
-			var fkValues []any
-			for _, row := range tableRows {
-				val, ok := row[fk.ColumnName]
-				if !ok || val == nil {
-					continue
-				}
-				if e.collectedPKs[parentTable] != nil && e.collectedPKs[parentTable][val] {
-					continue
-				}
-				fkValues = append(fkValues, val)
-			}
-
-			if len(fkValues) == 0 {
-				continue
-			}
-
-			fkValues = uniqueValues(fkValues)
-
-			parentCols, err := e.selectColumns(parentTable)
-			if err != nil {
-				return false, err
-			}
-			query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ANY($1)",
-				parentCols, QuoteQualifiedTable(parentTable), QuoteIdent(fk.ReferencedColumn))
-
-			rows, err := e.tx.Query(query, fkValues)
-			if err != nil {
-				return false, fmt.Errorf("parent query for %s failed: %w", parentTable, err)
-			}
-
-			beforeCount := len(e.collected[parentTable])
-			if err := e.collectRows(parentTable, rows); err != nil {
-				rows.Close()
-				return false, err
-			}
-			rows.Close()
-
-			afterCount := len(e.collected[parentTable])
-			if afterCount > beforeCount {
-				foundNew = true
-				newRows := afterCount - beforeCount
-				fmt.Printf("  ↑ %s... %d row(s) (parent of %s)\n", shortName(parentTable), newRows, shortName(tableName))
-			}
-		}
-	}
-
-	return foundNew, nil
-}
-
-func (e *Extractor) extractChildren(rootTable string) (bool, error) {
-	foundNew := false
-
-	type bfsItem struct {
-		table string
-		depth int
-	}
-
-	visited := make(map[string]bool)
-	queue := []bfsItem{{table: rootTable, depth: 0}}
-	visited[rootTable] = true
-
-	for t := range e.collected {
-		if !visited[t] {
-			visited[t] = true
-			queue = append(queue, bfsItem{table: t, depth: 0})
-		}
-	}
-
-	for len(queue) > 0 {
-		item := queue[0]
-		queue = queue[1:]
-
-		if e.options.Depth > 0 && item.depth >= e.options.Depth {
-			if len(e.invertedGraph[item.table]) > 0 {
-				e.warn("depth limit %d reached at %s; child tables not traversed", e.options.Depth, shortName(item.table))
-			}
-			continue
-		}
-
-		edges := e.invertedGraph[item.table]
-		for _, edge := range edges {
-			childTable := edge.ChildTable
-
-			if e.excludeSet[shortName(childTable)] || e.excludeSet[childTable] {
-				continue
-			}
-
-			parentRows := e.collected[item.table]
-			if len(parentRows) == 0 {
-				continue
-			}
-
-			var pkValues []any
-			for _, row := range parentRows {
-				val, ok := row[edge.ParentColumn]
-				if !ok || val == nil {
-					continue
-				}
-				pkValues = append(pkValues, val)
-			}
-
-			if len(pkValues) == 0 {
-				continue
-			}
-
-			pkValues = uniqueValues(pkValues)
-
-			childCols, err := e.selectColumns(childTable)
-			if err != nil {
-				return false, err
-			}
-			query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ANY($1) AND %s IS NOT NULL",
-				childCols, QuoteQualifiedTable(childTable), QuoteIdent(edge.ChildColumn), QuoteIdent(edge.ChildColumn))
-
-			if e.options.Limit > 0 {
-				query += fmt.Sprintf(" LIMIT %d", e.options.Limit)
-			}
-
-			rows, err := e.tx.Query(query, pkValues)
-			if err != nil {
-				return false, fmt.Errorf("child query for %s failed: %w", childTable, err)
-			}
-
-			beforeCount := len(e.collected[childTable])
-			if err := e.collectRows(childTable, rows); err != nil {
-				rows.Close()
-				return false, err
-			}
-			rows.Close()
-
-			afterCount := len(e.collected[childTable])
-
-			if e.options.Limit > 0 && afterCount >= e.options.Limit {
-				e.warn("table %s limited to %d rows, subgraph may be incomplete", shortName(childTable), e.options.Limit)
-			}
-
-			if afterCount > beforeCount {
-				foundNew = true
-				newRows := afterCount - beforeCount
-				fmt.Printf("  ↓ %s... %d row(s)\n", shortName(childTable), newRows)
-			}
-
-			if err := e.extractSelfReferencing(childTable); err != nil {
-				return false, err
-			}
-
-			if !visited[childTable] {
-				visited[childTable] = true
-				queue = append(queue, bfsItem{table: childTable, depth: item.depth + 1})
-			}
-		}
-	}
-
-	return foundNew, nil
-}
-
-func (e *Extractor) extractSelfReferencing(table string) error {
-	tableInfo, err := e.schema.GetTable(table)
-	if err != nil {
-		return nil
-	}
-
-	qualifiedName := tableInfo.Schema + "." + tableInfo.Name
-
-	var selfFKs []*ForeignKeyInfo
-	for _, fk := range tableInfo.ForeignKeys {
-		if fk.ReferencedTable == qualifiedName {
-			selfFKs = append(selfFKs, fk)
-		}
-	}
-
-	if len(selfFKs) == 0 {
-		return nil
-	}
-
-	for iteration := 0; iteration < maxTraversalIterations; iteration++ {
-		foundAny := false
-
-		for _, fk := range selfFKs {
-			var pkValues []any
-			for _, row := range e.collected[table] {
-				for _, pkCol := range tableInfo.PrimaryKey {
-					if val, ok := row[pkCol]; ok && val != nil {
-						pkValues = append(pkValues, val)
-					}
-				}
-			}
-
-			if len(pkValues) == 0 {
-				continue
-			}
-
-			pkValues = uniqueValues(pkValues)
-
-			selfCols, err := e.selectColumns(table)
-			if err != nil {
-				return err
-			}
-			query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ANY($1) AND %s IS NOT NULL",
-				selfCols, QuoteQualifiedTable(table), QuoteIdent(fk.ColumnName), QuoteIdent(fk.ColumnName))
-
-			rows, err := e.tx.Query(query, pkValues)
-			if err != nil {
-				return fmt.Errorf("self-referencing query for %s failed: %w", table, err)
-			}
-
-			before := len(e.collected[table])
-			if err := e.collectRows(table, rows); err != nil {
-				rows.Close()
-				return err
-			}
-			rows.Close()
-
-			if len(e.collected[table]) > before {
-				foundAny = true
-			}
-		}
-
-		if !foundAny {
-			break
-		}
-	}
-
-	return nil
-}
-
-func (e *Extractor) collectRows(tableName string, rows *sql.Rows) error {
-	columns, err := rows.Columns()
-	if err != nil {
-		return err
-	}
-
-	colTypes, err := rows.ColumnTypes()
-	if err != nil {
-		return err
-	}
-
-	tableInfo, _ := e.schema.GetTable(tableName)
-	var pkCols []string
-	if tableInfo != nil {
-		pkCols = tableInfo.PrimaryKey
-	}
-
-	genCols := e.generatedCols[tableName]
-
-	if e.collectedPKs[tableName] == nil {
-		e.collectedPKs[tableName] = make(map[any]bool)
-	}
-
-	for rows.Next() {
-		dest := make([]any, len(columns))
-		for i := range dest {
-			dest[i] = new(any)
-		}
-
-		if err := rows.Scan(dest...); err != nil {
-			return fmt.Errorf("scan failed for %s: %w", tableName, err)
-		}
-
-		row := make(map[string]any, len(columns))
-		for i, col := range columns {
-			if genCols[col] {
-				continue
-			}
-
-			rawVal := *(dest[i].(*any))
-			row[col] = convertValue(rawVal, colTypes[i])
-		}
-
-		if len(pkCols) > 0 {
-			pkKey := buildPKKey(row, pkCols)
-			if e.collectedPKs[tableName][pkKey] {
-				continue
-			}
-			e.collectedPKs[tableName][pkKey] = true
-		}
-
-		e.collected[tableName] = append(e.collected[tableName], row)
-	}
-
-	return rows.Err()
-}
-
-func convertValue(val any, colType *sql.ColumnType) any {
-	if val == nil {
-		return nil
-	}
-
-	switch v := val.(type) {
-	case time.Time:
-		typeName := strings.ToLower(colType.DatabaseTypeName())
-		if typeName == "DATE" || typeName == "date" {
-			return v.Format("2006-01-02")
-		}
-		return v.Format(time.RFC3339)
-
-	case []byte:
-		typeName := strings.ToUpper(colType.DatabaseTypeName())
-		if typeName == "JSON" || typeName == "JSONB" {
-			return string(v)
-		}
-		if typeName == "UUID" || len(v) == 16 {
-			return formatUUID(v)
-		}
-		return `\x` + hex.EncodeToString(v)
-
-	case [16]byte:
-		return formatUUID(v[:])
-
-	case int64, int32, int16, int8, float64, float32, bool, string:
-		return v
-
-	default:
-		return fmt.Sprintf("%v", v)
-	}
-}
-
-func formatUUID(b []byte) string {
-	if len(b) != 16 {
-		return hex.EncodeToString(b)
-	}
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}
-
-func buildPKKey(row map[string]any, pkCols []string) any {
-	if len(pkCols) == 1 {
-		return row[pkCols[0]]
-	}
-	parts := make([]string, len(pkCols))
-	for i, col := range pkCols {
-		parts[i] = fmt.Sprintf("%v", row[col])
-	}
-	return strings.Join(parts, "|")
-}
-
 func (e *Extractor) orderTablesForOutput() ([]string, error) {
 	tables := make([]string, 0, len(e.collected))
 	for t := range e.collected {
@@ -884,16 +446,4 @@ func (e *Extractor) warnExcludedParent(parentTable, childTable string) {
 func shortName(qualifiedName string) string {
 	_, table := parseTableName(qualifiedName)
 	return table
-}
-
-func uniqueValues(vals []any) []any {
-	seen := make(map[any]bool, len(vals))
-	result := make([]any, 0, len(vals))
-	for _, v := range vals {
-		if !seen[v] {
-			seen[v] = true
-			result = append(result, v)
-		}
-	}
-	return result
 }
