@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/boringsql/fixturize/fixturize"
 	"github.com/spf13/cobra"
@@ -33,6 +34,8 @@ Examples:
 	analyzeRoot          string
 	analyzeDepth         int
 	analyzeMinConfidence string
+	analyzeYAML          bool
+	analyzeOutput        string
 )
 
 func init() {
@@ -43,6 +46,8 @@ func init() {
 	analyzeCmd.Flags().StringVar(&analyzeRoot, "root", "", "Filter to tables reachable from this root table")
 	analyzeCmd.Flags().IntVar(&analyzeDepth, "depth", 0, "Max FK hops from root (0 = unlimited, only with --root)")
 	analyzeCmd.Flags().StringVar(&analyzeMinConfidence, "min-confidence", "low", "Minimum confidence level: low, medium, high")
+	analyzeCmd.Flags().BoolVar(&analyzeYAML, "yaml", false, "Output as YAML mask policy")
+	analyzeCmd.Flags().StringVar(&analyzeOutput, "output", "", "Write output to file instead of stdout (requires --yaml)")
 }
 
 func runAnalyze(cmd *cobra.Command, args []string) error {
@@ -82,7 +87,27 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 		tables = dbSchema.GetTables()
 	}
 
+	if analyzeOutput != "" && !analyzeYAML {
+		return fmt.Errorf("--output requires --yaml")
+	}
+
 	result := fixturize.AnalyzeSchema(dbSchema, tables, minConf)
-	fmt.Print(fixturize.FormatAnalysis(dbSchema, result))
+
+	var output string
+	if analyzeYAML {
+		output = fixturize.FormatAnalysisYAML(dbSchema, result)
+	} else {
+		output = fixturize.FormatAnalysis(dbSchema, result)
+	}
+
+	if analyzeOutput != "" {
+		if err := os.WriteFile(analyzeOutput, []byte(output), 0644); err != nil {
+			return fmt.Errorf("failed to write output: %w", err)
+		}
+		fmt.Printf("Wrote mask policy to %s\n", analyzeOutput)
+		return nil
+	}
+
+	fmt.Print(output)
 	return nil
 }

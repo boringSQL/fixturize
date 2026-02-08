@@ -228,6 +228,39 @@ func FormatAnalysis(schema *DatabaseSchema, result *AnalyzeResult) string {
 	return b.String()
 }
 
+func FormatAnalysisYAML(schema *DatabaseSchema, result *AnalyzeResult) string {
+	if len(result.Matches) == 0 {
+		return "masks:\n  pii: []\n"
+	}
+
+	var matchedTables []string
+	for t := range result.Matches {
+		matchedTables = append(matchedTables, t)
+	}
+	sorted := schema.TopologicalSort(matchedTables, nil)
+
+	var b strings.Builder
+	b.WriteString("masks:\n  pii:\n")
+
+	for _, tableName := range sorted {
+		matches := result.Matches[tableName]
+		for _, m := range matches {
+			entry := shortTableName(tableName) + "." + m.Column + "=" + m.MaskExpr
+			fmt.Fprintf(&b, "    - \"%s\"\n", strings.ReplaceAll(entry, `"`, `\"`))
+		}
+	}
+
+	return b.String()
+}
+
+func shortTableName(qualifiedName string) string {
+	schemaName, table := parseTableName(qualifiedName)
+	if schemaName == "public" {
+		return table
+	}
+	return qualifiedName
+}
+
 func (r *AnalyzeResult) TotalMatches() int {
 	total := 0
 	for _, matches := range r.Matches {
