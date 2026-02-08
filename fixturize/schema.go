@@ -27,6 +27,7 @@ type (
 		IsPrimaryKey    bool
 		IsForeignKey    bool
 		IsUnique        bool
+		IsGenerated     bool
 		ForeignKey      *ForeignKeyInfo
 		Default         *string
 	}
@@ -223,7 +224,8 @@ func getColumns(db *sql.DB, schemaName, tableName string) (map[string]*ColumnInf
 			format_type(a.atttypid, a.atttypmod),
 			NOT a.attnotnull,
 			pg_get_expr(d.adbin, d.adrelid),
-			a.attnum
+			a.attnum,
+			a.attgenerated
 		FROM pg_attribute a
 		LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
 		WHERE a.attrelid = ($1 || '.' || $2)::regclass
@@ -246,9 +248,10 @@ func getColumns(db *sql.DB, schemaName, tableName string) (map[string]*ColumnInf
 			isNullable      bool
 			columnDefault   *string
 			ordinalPosition int
+			attGenerated    string
 		)
 
-		if err := rows.Scan(&columnName, &dataType, &isNullable, &columnDefault, &ordinalPosition); err != nil {
+		if err := rows.Scan(&columnName, &dataType, &isNullable, &columnDefault, &ordinalPosition, &attGenerated); err != nil {
 			return nil, err
 		}
 
@@ -257,6 +260,7 @@ func getColumns(db *sql.DB, schemaName, tableName string) (map[string]*ColumnInf
 			Type:            dataType,
 			OrdinalPosition: ordinalPosition,
 			IsNullable:      isNullable,
+			IsGenerated:     attGenerated == "s",
 			Default:         columnDefault,
 		}
 

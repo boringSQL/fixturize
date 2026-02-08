@@ -69,7 +69,7 @@ func AnalyzeSchema(schema *DatabaseSchema, tables []string, minConfidence Confid
 		pkIsInt := pkColumnsAreInteger(table)
 
 		for _, col := range sortedColumns(table) {
-			if col.IsPrimaryKey || col.IsForeignKey {
+			if col.IsPrimaryKey || col.IsForeignKey || col.IsGenerated {
 				continue
 			}
 
@@ -108,7 +108,7 @@ func matchColumn(col *ColumnInfo, pkCols []string, pkIsInt bool) (PIIMatch, bool
 		var confidence ConfidenceLevel
 		switch {
 		case nameMatch && typeMatch:
-			confidence = ConfidenceMedium
+			confidence = ConfidenceHigh
 		case typeOnly:
 			confidence = ConfidenceMedium
 		case nameMatch:
