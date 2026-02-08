@@ -20,15 +20,16 @@ type (
 	}
 
 	ColumnInfo struct {
-		Name         string
-		Type         string
-		IsNullable   bool
-		IsPrimaryKey bool
-		IsForeignKey bool
-		IsUnique     bool
-		ForeignKey   *ForeignKeyInfo
-		Default      *string
-		MaxLength    *int
+		Name            string
+		Type            string
+		OrdinalPosition int
+		IsNullable      bool
+		IsPrimaryKey    bool
+		IsForeignKey    bool
+		IsUnique        bool
+		ForeignKey      *ForeignKeyInfo
+		Default         *string
+		MaxLength       *int
 	}
 
 	ForeignKeyInfo struct {
@@ -223,7 +224,8 @@ func getColumns(db *sql.DB, schemaName, tableName string) (map[string]*ColumnInf
 			data_type,
 			is_nullable,
 			column_default,
-			character_maximum_length
+			character_maximum_length,
+			ordinal_position
 		FROM information_schema.columns
 		WHERE table_schema = $1
 		  AND table_name = $2
@@ -239,22 +241,24 @@ func getColumns(db *sql.DB, schemaName, tableName string) (map[string]*ColumnInf
 	columns := make(map[string]*ColumnInfo)
 	for rows.Next() {
 		var (
-			columnName    string
-			dataType      string
-			isNullable    string
-			columnDefault *string
-			maxLength     *int64
+			columnName      string
+			dataType        string
+			isNullable      string
+			columnDefault   *string
+			maxLength       *int64
+			ordinalPosition int
 		)
 
-		if err := rows.Scan(&columnName, &dataType, &isNullable, &columnDefault, &maxLength); err != nil {
+		if err := rows.Scan(&columnName, &dataType, &isNullable, &columnDefault, &maxLength, &ordinalPosition); err != nil {
 			return nil, err
 		}
 
 		col := &ColumnInfo{
-			Name:       columnName,
-			Type:       dataType,
-			IsNullable: isNullable == "YES",
-			Default:    columnDefault,
+			Name:            columnName,
+			Type:            dataType,
+			OrdinalPosition: ordinalPosition,
+			IsNullable:      isNullable == "YES",
+			Default:         columnDefault,
 		}
 
 		if maxLength != nil {
