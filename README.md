@@ -78,6 +78,12 @@ fixturize extract --connection "$DB" \
 
 Format: `schema.table.column=sql_expression` (or `table.column=expr` for public schema).
 
+Since the expression runs as raw SQL in the SELECT, you can use `CASE` to preserve NULLs:
+
+```bash
+--mask "users.email=CASE WHEN email IS NOT NULL THEN 'user_' || id || '@test.com' END"
+```
+
 Masks are recorded in the fixture metadata so you know what was scrubbed.
 
 ## Precautions
