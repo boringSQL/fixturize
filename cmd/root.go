@@ -54,3 +54,31 @@ func Execute() {
 		os.Exit(1)
 	}
 }
+
+// resolveConnAndSchema resolves connection and schema from flags, profile, and env.
+func resolveConnAndSchema(cmd *cobra.Command, flagConn, flagSchema string) (conn, schema string, err error) {
+	conn = flagConn
+	schema = flagSchema
+
+	if loadedProfile != nil {
+		if !cmd.Flags().Changed("connection") && conn == "" {
+			conn = loadedProfile.Connection
+		}
+		if !cmd.Flags().Changed("schema") && schema == "" {
+			schema = loadedProfile.Schema
+		}
+	}
+	if schema == "" {
+		schema = "public"
+	}
+
+	if conn == "" {
+		conn = os.Getenv("DATABASE_URL")
+	}
+	if conn == "" {
+		return "", "", fmt.Errorf("connection string is required (use --connection, DATABASE_URL env var, or profile)")
+	}
+
+	conn = expandEnvVars(conn)
+	return conn, schema, nil
+}
