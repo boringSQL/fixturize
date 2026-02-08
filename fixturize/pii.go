@@ -24,7 +24,7 @@ var piiRules = []PIIRule{
 	{Category: "First Name", Names: []string{"firstname", "fname", "given", "forename", "givenname", "jmeno", "prenom", "vorname", "voornaam"}, Types: textTypes, Mask: "'First' || {pk}"},
 	{Category: "Last Name", Names: []string{"lastname", "lname", "surname", "familyname", "vorname", "nachname", "prijmeni"}, Types: textTypes, Mask: "'Last' || {pk}"},
 	{Category: "Full Name", Names: []string{"fullname", "displayname"}, Types: textTypes, Mask: "'User ' || {pk}"},
-	{Category: "Username", Names: []string{"username", "loginname", "handle", "screenname"}, Types: textTypes, Mask: "'user' || {pk}"},
+	{Category: "Username", Names: []string{"username", "loginname", "screenname"}, Types: textTypes, Mask: "'user' || {pk}"},
 	{Category: "Password", Names: []string{"password", "passwd", "pwd", "passhash", "pwhash"}, Types: textTypes, Mask: "'$2a$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWX'"},
 	{Category: "Date of Birth", Names: []string{"dob", "birthdate", "dateofbirth", "birthday", "geburtsdatum", "date_naissance", "datum_narozeni"}, Types: []string{"date", "timestamp"}, Mask: "'1990-01-01'::date + ({pki} % 10000)"},
 }
@@ -52,6 +52,10 @@ func matchesType(colType string, typePatterns []string) bool {
 		}
 	}
 	return false
+}
+
+func isTextType(colType string) bool {
+	return matchesType(colType, textTypes)
 }
 
 func isIntegerType(colType string) bool {
