@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/boringsql/fixturize/fixturize"
 	"github.com/spf13/cobra"
@@ -47,36 +46,18 @@ func init() {
 }
 
 func runAnalyze(cmd *cobra.Command, args []string) error {
-	conn := analyzeConn
-	schema := analyzeSchema
+	conn, schema, err := resolveConnAndSchema(cmd, analyzeConn, analyzeSchema)
+	if err != nil {
+		return err
+	}
 	root := analyzeRoot
 	depth := analyzeDepth
-
-	if loadedProfile != nil {
-		if !cmd.Flags().Changed("connection") && conn == "" {
-			conn = loadedProfile.Connection
-		}
-		if !cmd.Flags().Changed("schema") && schema == "" {
-			schema = loadedProfile.Schema
-		}
-	}
-	if schema == "" {
-		schema = "public"
-	}
-
-	if conn == "" {
-		conn = os.Getenv("DATABASE_URL")
-	}
-	if conn == "" {
-		return fmt.Errorf("connection string is required (use --connection, DATABASE_URL env var, or profile)")
-	}
 
 	minConf, err := fixturize.ParseConfidence(analyzeMinConfidence)
 	if err != nil {
 		return err
 	}
 
-	conn = expandEnvVars(conn)
 	db, err := fixturize.OpenDB(conn)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)

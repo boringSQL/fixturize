@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/boringsql/fixturize/fixturize"
 	"github.com/spf13/cobra"
@@ -46,16 +45,12 @@ func init() {
 }
 
 func runApply(cmd *cobra.Command, args []string) error {
-	conn, force, disableTriggers, syncSequences := mergeApplyConfig(cmd)
-
-	if conn == "" {
-		conn = os.Getenv("DATABASE_URL")
+	conn, _, err := resolveConnAndSchema(cmd, applyConn, "")
+	if err != nil {
+		return err
 	}
-	if conn == "" {
-		return fmt.Errorf("connection string is required (use --connection, DATABASE_URL env var, or profile)")
-	}
+	force, disableTriggers, syncSequences := mergeApplyFlags(cmd)
 
-	conn = expandEnvVars(conn)
 	db, err := fixturize.OpenDB(conn)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
@@ -85,8 +80,7 @@ func runApply(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func mergeApplyConfig(cmd *cobra.Command) (conn string, force, disableTriggers, syncSequences bool) {
-	conn = applyConn
+func mergeApplyFlags(cmd *cobra.Command) (force, disableTriggers, syncSequences bool) {
 	force = applyForce
 	disableTriggers = applyDisableTriggers
 	syncSequences = applySyncSequences
@@ -96,10 +90,6 @@ func mergeApplyConfig(cmd *cobra.Command) (conn string, force, disableTriggers, 
 	}
 
 	p := loadedProfile
-
-	if !cmd.Flags().Changed("connection") && conn == "" {
-		conn = p.Connection
-	}
 	if !cmd.Flags().Changed("force") && !force {
 		force = p.Apply.Force
 	}
