@@ -27,6 +27,15 @@ var piiRules = []PIIRule{
 	{Category: "Username", Names: []string{"username", "loginname", "screenname"}, Types: textTypes, Mask: "'user' || {pk}"},
 	{Category: "Password", Names: []string{"password", "passwd", "pwd", "passhash", "pwhash"}, Types: textTypes, Mask: "'$2a$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWX'"},
 	{Category: "Date of Birth", Names: []string{"dob", "birthdate", "dateofbirth", "birthday", "geburtsdatum", "date_naissance", "datum_narozeni"}, Types: []string{"date", "timestamp"}, Mask: "'1990-01-01'::date + ({pki} % 10000)"},
+
+	// Location
+	{Category: "Address", Names: []string{"address", "street", "addr", "address1", "address2", "adresse", "strasse", "adresa", "ulice"}, Types: textTypes, Mask: "{pk} || ' Test Street'"},
+	{Category: "City", Names: []string{"city", "town", "municipality", "stadt", "ville", "mesto"}, Types: textTypes, Mask: "'TestCity'"},
+	{Category: "State", Names: []string{"state", "province", "region", "region", "land"}, Types: textTypes, Mask: "'TS'"},
+	{Category: "Zip Code", Names: []string{"zip", "postal", "postcode", "zipcode", "psc", "plz"}, Types: textTypes, Mask: "LPAD(({pki} % 100000)::text, 5, '0')"},
+	{Category: "Country", Names: []string{"country", "countrycode", "zeme", "land"}, Types: textTypes, Mask: "'US'"},
+	{Category: "Latitude", Names: []string{"lat", "latitude"}, Types: numericTypes, Mask: "37.0 + ({pki} % 100) * 0.01"},
+	{Category: "Longitude", Names: []string{"lon", "lng", "longitude"}, Types: numericTypes, Mask: "-122.0 + ({pki} % 100) * 0.01"},
 }
 
 // word level matching (user_email is going to be processed like [user,email])
