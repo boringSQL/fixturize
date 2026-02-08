@@ -4,8 +4,10 @@ Extract consistent data sub-graphs from a PostgreSQL database and apply them els
 
 ## What it does
 
-1. **`extract`** - Pick a root table and (optional) filtering clauses. Fixturize will follow foreign keys in both directions (parents and children) to collect a self-container snapshot of the data.
+1. **`extract`** - Pick a root table and (optional) filtering clauses. Fixturize will follow foreign keys in both directions (parents and children) to collect a self-contained snapshot of the data.
 2. **`apply`** - Load the snapshot into another database. Tables are inserted in FK-dependency order, constraints are deferred.
+3. **`inspect`** - Display schema structure with FK relationships without extracting any data.
+4. **`analyze`** - Auto-detect PII columns by scanning column names and types, and suggest mask expressions.
 
 ## Install
 
@@ -54,6 +56,50 @@ fixturize apply --connection "postgresql://..." fixtures/org-42.json
 fixturize apply --connection "postgresql://..." --force fixtures/org-42.json
 ````
 
+### Inspect
+
+Preview the table structure before extraction.
+
+```bash
+# show all tables with columns, PKs, FKs, unique constraints
+fixturize inspect --connection "$DB"
+
+# only tables reachable from users (2 FK hops)
+fixturize inspect --connection "$DB" --root users --depth 2
+```
+
+### Analyze
+
+Scan schema for PII columns and get ready-to-use `--mask` expressions:
+
+```bash
+fixturize analyze --connection "$DB"
+```
+
+```
+public.users
+  email       character varying(255)  Email       MED   'user_' || "id" || '@test.com'
+  first_name  character varying(100)  First Name  MED   'First' || "id"
+  last_name   character varying(100)  Last Name   MED   'Last' || "id"
+
+public.contacts
+  phone       character varying(20)   Phone       MED   '+1555' || LPAD(("id" % 10000000)::text, 7, '0')
+
+4 PII column(s) in 2 table(s)
+```
+
+Filter by confidence level or scope to a subgraph:
+
+```bash
+# only medium+ confidence (skip noisy matches)
+fixturize analyze --connection "$DB" --min-confidence medium
+
+# scope to tables reachable from users
+fixturize analyze --connection "$DB" --root users --depth 2
+```
+
+Detection uses column name patterns (word-level matching, e.g. `user_email` matches but `emailed_at` does not) combined with PostgreSQL type checking. Columns that are boolean, timestamp, integer, PK, or FK are automatically excluded to reduce false positives.
+
 ### Connection
 
 Pass `--connection` or set `DATABASE_URL` env variable:
@@ -85,6 +131,8 @@ Since the expression runs as raw SQL in the SELECT, you can use `CASE` to preser
 ```
 
 Masks are recorded in the fixture metadata so you know what was scrubbed.
+
+Use `fixturize analyze` to auto-detect which columns need masking and get suggested expressions.
 
 ## Precautions
 
