@@ -36,6 +36,17 @@ var piiRules = []PIIRule{
 	{Category: "Country", Names: []string{"country", "countrycode", "zeme", "land"}, Types: textTypes, Mask: "'US'"},
 	{Category: "Latitude", Names: []string{"lat", "latitude"}, Types: numericTypes, Mask: "37.0 + ({pki} % 100) * 0.01"},
 	{Category: "Longitude", Names: []string{"lon", "lng", "longitude"}, Types: numericTypes, Mask: "-122.0 + ({pki} % 100) * 0.01"},
+
+	// Financial
+	{Category: "Credit Card", Names: []string{"creditcard", "ccnumber", "cardnumber", "pan"}, Types: textTypes, Mask: "'4532000000' || LPAD(({pki} % 10000)::text, 4, '0')"},
+	{Category: "CVV", Names: []string{"cvv", "cvc", "cardcode"}, Types: textTypes, Mask: "LPAD(({pki} % 1000)::text, 3, '0')"},
+	{Category: "Bank Account", Names: []string{"accountnumber", "bankaccount", "iban", "kontonummer", "kontonr", "cislouctu"}, Types: textTypes, Mask: "'XXXX' || LPAD(({pki} % 10000)::text, 4, '0')"},
+	{Category: "Routing Number", Names: []string{"routing", "routingnumber", "sortcode"}, Types: textTypes, Mask: "'021000021'"},
+	{Category: "Salary", Names: []string{"salary", "compensation", "wage", "income", "gehalt", "plat"}, Types: numericTypes, Mask: "50000 + ({pki} % 100) * 1000"},
+
+	// Secrets / API keys
+	{Category: "API Key", Names: []string{"apikey", "apisecret", "secretkey", "accesskey", "clientsecret", "privatekey", "signingkey", "encryptionkey", "webhooksecret", "appsecret", "appkey"}, Types: textTypes, Mask: "'sk_test_' || LPAD({pki}::text, 24, '0')"},
+	{Category: "Access Token", Names: []string{"token", "accesstoken", "authtoken", "apitoken", "refreshtoken", "bearertoken"}, Types: textTypes, Mask: "'tok_test_' || LPAD({pki}::text, 24, '0')"},
 }
 
 // word level matching (user_email is going to be processed like [user,email])
