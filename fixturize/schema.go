@@ -29,7 +29,6 @@ type (
 		IsUnique        bool
 		ForeignKey      *ForeignKeyInfo
 		Default         *string
-		MaxLength       *int
 	}
 
 	ForeignKeyInfo struct {
@@ -220,16 +219,17 @@ func parseTableName(name string) (schema, table string) {
 func getColumns(db *sql.DB, schemaName, tableName string) (map[string]*ColumnInfo, error) {
 	query := `
 		SELECT
-			column_name,
-			data_type,
-			is_nullable,
-			column_default,
-			character_maximum_length,
-			ordinal_position
-		FROM information_schema.columns
-		WHERE table_schema = $1
-		  AND table_name = $2
-		ORDER BY ordinal_position
+			a.attname,
+			format_type(a.atttypid, a.atttypmod),
+			NOT a.attnotnull,
+			pg_get_expr(d.adbin, d.adrelid),
+			a.attnum
+		FROM pg_attribute a
+		LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+		WHERE a.attrelid = ($1 || '.' || $2)::regclass
+		  AND a.attnum > 0
+		  AND NOT a.attisdropped
+		ORDER BY a.attnum
 	`
 
 	rows, err := db.Query(query, schemaName, tableName)
@@ -243,13 +243,12 @@ func getColumns(db *sql.DB, schemaName, tableName string) (map[string]*ColumnInf
 		var (
 			columnName      string
 			dataType        string
-			isNullable      string
+			isNullable      bool
 			columnDefault   *string
-			maxLength       *int64
 			ordinalPosition int
 		)
 
-		if err := rows.Scan(&columnName, &dataType, &isNullable, &columnDefault, &maxLength, &ordinalPosition); err != nil {
+		if err := rows.Scan(&columnName, &dataType, &isNullable, &columnDefault, &ordinalPosition); err != nil {
 			return nil, err
 		}
 
@@ -257,13 +256,8 @@ func getColumns(db *sql.DB, schemaName, tableName string) (map[string]*ColumnInf
 			Name:            columnName,
 			Type:            dataType,
 			OrdinalPosition: ordinalPosition,
-			IsNullable:      isNullable == "YES",
+			IsNullable:      isNullable,
 			Default:         columnDefault,
-		}
-
-		if maxLength != nil {
-			length := int(*maxLength)
-			col.MaxLength = &length
 		}
 
 		columns[columnName] = col
