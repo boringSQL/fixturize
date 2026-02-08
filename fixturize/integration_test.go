@@ -966,6 +966,90 @@ func TestNestedPartitions(t *testing.T) {
 	}
 }
 
+func TestAnalyzeSchemaIntegration(t *testing.T) {
+	schema, err := IntrospectSchema(testDB)
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+
+	tables := schema.GetTables()
+	result := AnalyzeSchema(schema, tables, ConfidenceLow)
+
+	// users.email (text) should be detected as Email with HIGH confidence
+	userMatches := result.Matches["public.users"]
+	var emailMatch, fullNameMatch *PIIMatch
+	for i, m := range userMatches {
+		switch m.Column {
+		case "email":
+			emailMatch = &userMatches[i]
+		case "full_name":
+			fullNameMatch = &userMatches[i]
+		}
+	}
+
+	if emailMatch == nil {
+		t.Error("expected users.email to be detected as PII")
+	} else {
+		if emailMatch.Category != "Email" {
+			t.Errorf("users.email category = %q, want Email", emailMatch.Category)
+		}
+		if emailMatch.Confidence < ConfidenceHigh {
+			t.Errorf("users.email confidence = %d, want >= HIGH", emailMatch.Confidence)
+		}
+	}
+
+	// users.full_name (text) should be detected as Full Name with HIGH confidence
+	if fullNameMatch == nil {
+		t.Error("expected users.full_name to be detected as PII")
+	} else {
+		if fullNameMatch.Category != "Full Name" {
+			t.Errorf("users.full_name category = %q, want Full Name", fullNameMatch.Category)
+		}
+		if fullNameMatch.Confidence < ConfidenceHigh {
+			t.Errorf("users.full_name confidence = %d, want >= HIGH", fullNameMatch.Confidence)
+		}
+	}
+
+	// PK columns must never appear in matches
+	for _, matches := range result.Matches {
+		for _, m := range matches {
+			if m.Column == "id" {
+				t.Errorf("PK column 'id' should not be detected in %s", m.Table)
+			}
+		}
+	}
+
+	// FK columns must never appear in matches
+	fkColumns := map[string]bool{
+		"org_id": true, "owner_id": true, "parent_id": true,
+		"department_id": true, "lead_employee_id": true, "task_id": true,
+		"workspace_id": true, "project_id": true,
+	}
+	for _, matches := range result.Matches {
+		for _, m := range matches {
+			if fkColumns[m.Column] {
+				t.Errorf("FK column %q should not be detected in %s", m.Column, m.Table)
+			}
+		}
+	}
+
+	// Bare 'name' columns should NOT match any PII rule
+	for table, matches := range result.Matches {
+		for _, m := range matches {
+			if m.Column == "name" {
+				t.Errorf("bare 'name' column should not be detected as PII in %s", table)
+			}
+		}
+	}
+
+	// Mask expressions should reference real PK columns
+	if emailMatch != nil {
+		if !strings.Contains(emailMatch.MaskExpr, `"id"`) {
+			t.Errorf("email mask should reference PK column \"id\", got %q", emailMatch.MaskExpr)
+		}
+	}
+}
+
 func TestCompositeForeignKey(t *testing.T) {
 	resetDB(t, testDB)
 

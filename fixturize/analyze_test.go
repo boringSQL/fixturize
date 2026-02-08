@@ -149,8 +149,8 @@ func TestAnalyzeSchema_SkipsPKAndFK(t *testing.T) {
 			if m.Category != "Email" {
 				t.Errorf("expected Email category, got %s", m.Category)
 			}
-			if m.Confidence < ConfidenceMedium {
-				t.Errorf("expected at least MEDIUM confidence for email varchar, got %d", m.Confidence)
+			if m.Confidence < ConfidenceHigh {
+				t.Errorf("expected HIGH confidence for email varchar (name+type match), got %d", m.Confidence)
 			}
 		}
 	}
@@ -232,6 +232,9 @@ func TestFormatAnalysis(t *testing.T) {
 	}
 	if !strings.Contains(output, "Email") {
 		t.Error("expected Email category in output")
+	}
+	if !strings.Contains(output, "HIGH") {
+		t.Error("expected HIGH confidence for email (name+type match)")
 	}
 	if !strings.Contains(output, "PII column(s)") {
 		t.Error("expected summary line in output")
@@ -602,6 +605,138 @@ func TestTotalMatches_Empty(t *testing.T) {
 
 	if got := result.TotalMatches(); got != 0 {
 		t.Errorf("TotalMatches() = %d, want 0", got)
+	}
+}
+
+func TestAnalyzeSchema_SkipsGenerated(t *testing.T) {
+	schema := &DatabaseSchema{
+		tables: map[string]*TableInfo{
+			"public.users": {
+				Schema:     "public",
+				Name:       "users",
+				PrimaryKey: []string{"id"},
+				Columns: map[string]*ColumnInfo{
+					"id":           {Name: "id", Type: "bigint", OrdinalPosition: 1, IsPrimaryKey: true},
+					"email":        {Name: "email", Type: "character varying(255)", OrdinalPosition: 2},
+					"display_name": {Name: "display_name", Type: "text", OrdinalPosition: 3, IsGenerated: true},
+				},
+			},
+		},
+	}
+
+	result := AnalyzeSchema(schema, []string{"public.users"}, ConfidenceLow)
+	matches := result.Matches["public.users"]
+
+	for _, m := range matches {
+		if m.Column == "display_name" {
+			t.Error("generated column should be skipped")
+		}
+	}
+
+	found := false
+	for _, m := range matches {
+		if m.Column == "email" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("non-generated PII column should still be detected")
+	}
+}
+
+func TestAnalyzeSchema_APIKeyRules(t *testing.T) {
+	schema := &DatabaseSchema{
+		tables: map[string]*TableInfo{
+			"public.configs": {
+				Schema:     "public",
+				Name:       "configs",
+				PrimaryKey: []string{"id"},
+				Columns: map[string]*ColumnInfo{
+					"id":             {Name: "id", Type: "bigint", OrdinalPosition: 1, IsPrimaryKey: true},
+					"api_key":        {Name: "api_key", Type: "character varying(255)", OrdinalPosition: 2},
+					"secret_key":     {Name: "secret_key", Type: "text", OrdinalPosition: 3},
+					"access_token":   {Name: "access_token", Type: "character varying(255)", OrdinalPosition: 4},
+					"refresh_token":  {Name: "refresh_token", Type: "text", OrdinalPosition: 5},
+					"token":          {Name: "token", Type: "text", OrdinalPosition: 6},
+					"client_secret":  {Name: "client_secret", Type: "varchar(500)", OrdinalPosition: 7},
+					"webhook_secret": {Name: "webhook_secret", Type: "text", OrdinalPosition: 8},
+					"api_version":    {Name: "api_version", Type: "text", OrdinalPosition: 9},
+				},
+			},
+		},
+	}
+
+	result := AnalyzeSchema(schema, []string{"public.configs"}, ConfidenceLow)
+	matches := result.Matches["public.configs"]
+
+	expected := map[string]struct {
+		category   string
+		confidence ConfidenceLevel
+	}{
+		"api_key":        {"API Key", ConfidenceHigh},
+		"secret_key":     {"API Key", ConfidenceHigh},
+		"access_token":   {"Access Token", ConfidenceHigh},
+		"refresh_token":  {"Access Token", ConfidenceHigh},
+		"token":          {"Access Token", ConfidenceHigh},
+		"client_secret":  {"API Key", ConfidenceHigh},
+		"webhook_secret": {"API Key", ConfidenceHigh},
+	}
+
+	found := make(map[string]bool)
+	for _, m := range matches {
+		found[m.Column] = true
+		exp, ok := expected[m.Column]
+		if !ok {
+			continue
+		}
+		if m.Category != exp.category {
+			t.Errorf("%s: category = %q, want %q", m.Column, m.Category, exp.category)
+		}
+		if m.Confidence < exp.confidence {
+			t.Errorf("%s: confidence = %d, want >= %d", m.Column, m.Confidence, exp.confidence)
+		}
+	}
+
+	for col := range expected {
+		if !found[col] {
+			t.Errorf("expected column %q to be detected as PII", col)
+		}
+	}
+
+	// api_version should NOT match any PII rule
+	if found["api_version"] {
+		t.Error("api_version should not be detected as PII")
+	}
+}
+
+func TestAnalyzeSchema_APIKeyMaskExpressions(t *testing.T) {
+	schema := &DatabaseSchema{
+		tables: map[string]*TableInfo{
+			"public.settings": {
+				Schema:     "public",
+				Name:       "settings",
+				PrimaryKey: []string{"id"},
+				Columns: map[string]*ColumnInfo{
+					"id":           {Name: "id", Type: "bigint", OrdinalPosition: 1, IsPrimaryKey: true},
+					"api_key":      {Name: "api_key", Type: "text", OrdinalPosition: 2},
+					"access_token": {Name: "access_token", Type: "text", OrdinalPosition: 3},
+				},
+			},
+		},
+	}
+
+	result := AnalyzeSchema(schema, []string{"public.settings"}, ConfidenceLow)
+	for _, m := range result.Matches["public.settings"] {
+		switch m.Column {
+		case "api_key":
+			if !strings.Contains(m.MaskExpr, "sk_test_") {
+				t.Errorf("api_key mask should contain 'sk_test_', got %q", m.MaskExpr)
+			}
+		case "access_token":
+			if !strings.Contains(m.MaskExpr, "tok_test_") {
+				t.Errorf("access_token mask should contain 'tok_test_', got %q", m.MaskExpr)
+			}
+		}
 	}
 }
 
