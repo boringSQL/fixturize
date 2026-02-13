@@ -99,6 +99,10 @@ func matchColumn(col *ColumnInfo, pkCols []string, pkIsInt bool) (PIIMatch, bool
 			continue
 		}
 
+		if nameMatch && hasNoiseSuffix(col.Name) {
+			continue
+		}
+
 		// Name match without type match: only plausible if column is text-like
 		// (skips boolean, timestamp, integer, etc. that just happen to have PII words in the name)
 		if nameMatch && !typeMatch && !isTextType(col.Type) {

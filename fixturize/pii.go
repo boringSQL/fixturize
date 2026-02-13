@@ -49,6 +49,24 @@ var piiRules = []PIIRule{
 	{Category: "Access Token", Names: []string{"token", "accesstoken", "authtoken", "apitoken", "refreshtoken", "bearertoken"}, Types: textTypes, Mask: "'tok_test_' || LPAD({pki}::text, 24, '0')"},
 }
 
+var noiseSuffixes = map[string]bool{
+	"type": true, "template": true, "subject": true, "body": true,
+	"format": true, "policy": true, "hint": true, "log": true,
+	"error": true, "config": true, "url": true, "prefix": true,
+	"method": true, "provider": true, "source": true, "reason": true,
+	"description": true, "mode": true, "level": true, "regex": true,
+	"pattern": true, "rule": true, "setting": true, "option": true,
+	"preference": true,
+}
+
+func hasNoiseSuffix(colName string) bool {
+	words := strings.Split(strings.ToLower(colName), "_")
+	if len(words) <= 1 {
+		return false
+	}
+	return noiseSuffixes[words[len(words)-1]]
+}
+
 // word level matching (user_email is going to be processed like [user,email])
 func matchesColumnName(colName string, patterns []string) bool {
 	lower := strings.ToLower(colName)
