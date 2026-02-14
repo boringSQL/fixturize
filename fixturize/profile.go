@@ -19,15 +19,18 @@ type (
 	}
 
 	ExtractProfile struct {
-		Root             string   `yaml:"root"`
-		Output           string   `yaml:"output"`
-		Limit            int      `yaml:"limit"`
-		Depth            int      `yaml:"depth"`
-		StatementTimeout int      `yaml:"statement_timeout"`
-		Include          []string `yaml:"include"`
-		Exclude          []string `yaml:"exclude"`
-		MaskPolicies     []string `yaml:"mask_policies"`
-		Masks            []string `yaml:"masks"`
+		Root                string   `yaml:"root"`
+		Output              string   `yaml:"output"`
+		Format              string   `yaml:"format"`
+		Limit               int      `yaml:"limit"`
+		Depth               int      `yaml:"depth"`
+		StatementTimeout    int      `yaml:"statement_timeout"`
+		Transaction         bool     `yaml:"transaction"`
+		OnConflictDoNothing bool     `yaml:"on_conflict_do_nothing"`
+		Include             []string `yaml:"include"`
+		Exclude             []string `yaml:"exclude"`
+		MaskPolicies        []string `yaml:"mask_policies"`
+		Masks               []string `yaml:"masks"`
 	}
 
 	ApplyProfile struct {

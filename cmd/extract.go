@@ -39,24 +39,32 @@ Examples:
     --mask "auth.users.email='user_' || id || '@test.com'" \
     --mask "auth.users.name='User ' || id"
 
+  # Output as SQL INSERT statements
+  fixturize extract --connection "$DB" \
+    --root "organizations WHERE id = 42" \
+    --format sql --transaction --on-conflict-do-nothing
+
   # Preview without writing
   fixturize extract --connection "$DB" \
     --root "users LIMIT 5" --dry-run`,
 		RunE: runExtract,
 	}
 
-	extractConn             string
-	extractRoot             string
-	extractSchema           string
-	extractOutput           string
-	extractLimit            int
-	extractDepth            int
-	extractInclude          string
-	extractExclude          string
-	extractMask             []string
-	extractStatementTimeout int
-	extractDryRun           bool
-	extractVerbose          bool
+	extractConn                string
+	extractRoot                string
+	extractSchema              string
+	extractOutput              string
+	extractFormat              string
+	extractLimit               int
+	extractDepth               int
+	extractInclude             string
+	extractExclude             string
+	extractMask                []string
+	extractStatementTimeout    int
+	extractTransaction         bool
+	extractOnConflictDoNothing bool
+	extractDryRun              bool
+	extractVerbose             bool
 )
 
 func init() {
@@ -65,14 +73,17 @@ func init() {
 	extractCmd.Flags().StringVar(&extractConn, "connection", "", "PostgreSQL connection string")
 	extractCmd.Flags().StringVar(&extractRoot, "root", "", "Root table + optional WHERE/ORDER BY/LIMIT")
 	extractCmd.Flags().StringVar(&extractSchema, "schema", "", "Default schema for unqualified names")
-	extractCmd.Flags().StringVarP(&extractOutput, "output", "o", "", "Output file path (default: extracted.json)")
+	extractCmd.Flags().StringVarP(&extractOutput, "output", "o", "", "Output file path (default: extracted.json or extracted.sql)")
+	extractCmd.Flags().StringVar(&extractFormat, "format", "json", "Output format: json or sql")
 	extractCmd.Flags().IntVar(&extractLimit, "limit", 0, "Max rows per child table (0 = unlimited)")
 	extractCmd.Flags().IntVar(&extractDepth, "depth", 0, "Max FK hops from root (0 = follow everything)")
 	extractCmd.Flags().StringVar(&extractInclude, "include", "", "Extra tables to include (comma-separated)")
 	extractCmd.Flags().StringVar(&extractExclude, "exclude", "", "Tables to skip (comma-separated)")
 	extractCmd.Flags().StringArrayVar(&extractMask, "mask", nil, "Mask column with SQL expression (table.column=expr, repeatable)")
 	extractCmd.Flags().IntVar(&extractStatementTimeout, "statement-timeout", 0, "Per-statement timeout in seconds")
-	extractCmd.Flags().BoolVar(&extractDryRun, "dry-run", false, "Print JSON to stdout, don't write file")
+	extractCmd.Flags().BoolVar(&extractTransaction, "transaction", false, "Wrap SQL output in BEGIN/COMMIT")
+	extractCmd.Flags().BoolVar(&extractOnConflictDoNothing, "on-conflict-do-nothing", false, "Append ON CONFLICT DO NOTHING to SQL INSERTs")
+	extractCmd.Flags().BoolVar(&extractDryRun, "dry-run", false, "Print output to stdout, don't write file")
 	extractCmd.Flags().BoolVarP(&extractVerbose, "verbose", "v", false, "Print FK edges and lookup counts during traversal")
 }
 
@@ -82,6 +93,7 @@ func expandEnvVars(s string) string {
 
 func runExtract(cmd *cobra.Command, args []string) error {
 	conn, root, schema, output, limit, depth, include, exclude, masks, statementTimeout := mergeExtractConfig(cmd)
+	format, transaction, onConflictDN := mergeFormatConfig(cmd)
 
 	if conn == "" {
 		conn = os.Getenv("DATABASE_URL")
@@ -130,14 +142,29 @@ func runExtract(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", w)
 	}
 
+	var outputData []byte
+	switch format {
+	case "sql":
+		outputData = result.Fixture.ToSQL(fixturize.SQLOptions{
+			Transaction:  transaction,
+			OnConflictDN: onConflictDN,
+		})
+	default:
+		outputData = result.JSON
+	}
+
 	if extractDryRun {
-		fmt.Println(string(result.JSON))
+		fmt.Println(string(outputData))
 		return nil
 	}
 
 	outputPath := output
 	if outputPath == "" {
-		outputPath = "extracted.json"
+		if format == "sql" {
+			outputPath = "extracted.sql"
+		} else {
+			outputPath = "extracted.json"
+		}
 	}
 
 	dir := filepath.Dir(outputPath)
@@ -147,7 +174,7 @@ func runExtract(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if err := os.WriteFile(outputPath, result.JSON, 0644); err != nil {
+	if err := os.WriteFile(outputPath, outputData, 0644); err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 
@@ -255,4 +282,27 @@ func trimSpace(s string) string {
 		end--
 	}
 	return s[start:end]
+}
+
+func mergeFormatConfig(cmd *cobra.Command) (format string, transaction, onConflictDN bool) {
+	format = extractFormat
+	transaction = extractTransaction
+	onConflictDN = extractOnConflictDoNothing
+
+	if loadedProfile == nil {
+		return
+	}
+
+	p := loadedProfile
+	if !cmd.Flags().Changed("format") && format == "json" && p.Extract.Format != "" {
+		format = p.Extract.Format
+	}
+	if !cmd.Flags().Changed("transaction") && !transaction {
+		transaction = p.Extract.Transaction
+	}
+	if !cmd.Flags().Changed("on-conflict-do-nothing") && !onConflictDN {
+		onConflictDN = p.Extract.OnConflictDoNothing
+	}
+
+	return
 }

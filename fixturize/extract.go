@@ -379,6 +379,7 @@ func (e *Extractor) buildFixture(orderedTables []string) *Fixture {
 	}
 
 	fixture := NewFixture(e.options.Root, appliedMasks)
+	fixture.TableOrder = orderedTables
 
 	for _, tableName := range orderedTables {
 		rows := e.collected[tableName]
@@ -406,6 +407,9 @@ func (e *Extractor) buildFixture(orderedTables []string) *Fixture {
 		}
 
 		fixture.AddTable(tableName, filteredCols, rowData)
+		if e.identityTables[tableName] {
+			fixture.Tables[tableName].IdentityColumns = true
+		}
 	}
 
 	// Compute untouched tables

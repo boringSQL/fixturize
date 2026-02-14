@@ -7,8 +7,9 @@ import (
 
 type (
 	Fixture struct {
-		Meta   FixtureMeta              `json:"meta"`
-		Tables map[string]*FixtureTable `json:"tables"`
+		Meta       FixtureMeta              `json:"meta"`
+		TableOrder []string                 `json:"table_order,omitempty"`
+		Tables     map[string]*FixtureTable `json:"tables"`
 	}
 
 	FixtureMeta struct {
@@ -19,8 +20,9 @@ type (
 	}
 
 	FixtureTable struct {
-		Columns []string `json:"columns"`
-		Rows    [][]any  `json:"rows"`
+		Columns         []string `json:"columns"`
+		Rows            [][]any  `json:"rows"`
+		IdentityColumns bool     `json:"identity_columns,omitempty"`
 	}
 )
 
