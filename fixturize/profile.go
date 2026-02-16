@@ -46,16 +46,13 @@ func LoadProfile(path string) (*Profile, error) {
 		return nil, fmt.Errorf("failed to read profile: %w", err)
 	}
 
-	rawContent := string(data)
-	if err := validateEnvVars(rawContent); err != nil {
-		return nil, err
+	var profile Profile
+	if err := yaml.Unmarshal(data, &profile); err != nil {
+		return nil, fmt.Errorf("failed to parse profile: %w", err)
 	}
 
-	content := interpolateEnvVars(rawContent)
-
-	var profile Profile
-	if err := yaml.Unmarshal([]byte(content), &profile); err != nil {
-		return nil, fmt.Errorf("failed to parse profile: %w", err)
+	if err := expandConnectionEnvVars(&profile); err != nil {
+		return nil, err
 	}
 
 	if err := profile.Validate(); err != nil {
@@ -65,8 +62,15 @@ func LoadProfile(path string) (*Profile, error) {
 	return &profile, nil
 }
 
-func interpolateEnvVars(content string) string {
-	return os.Expand(content, os.Getenv)
+func expandConnectionEnvVars(p *Profile) error {
+	if p.Connection == "" {
+		return nil
+	}
+	if err := validateEnvVars(p.Connection); err != nil {
+		return err
+	}
+	p.Connection = os.Expand(p.Connection, os.Getenv)
+	return nil
 }
 
 func (p *Profile) ResolveMasks() []string {
