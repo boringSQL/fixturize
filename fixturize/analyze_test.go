@@ -740,6 +740,124 @@ func TestAnalyzeSchema_APIKeyMaskExpressions(t *testing.T) {
 	}
 }
 
+func TestHasNoiseSuffix(t *testing.T) {
+	tests := []struct {
+		colName string
+		want    bool
+	}{
+		{"email", false},
+		{"email_subject", true},
+		{"phone_type", true},
+		{"address_type", true},
+		{"token_config", true},
+		{"password_hint", true},
+		{"email_address", false},
+		{"home_address", false},
+		{"primary_email", false},
+		{"user_email", false},
+		{"token", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.colName, func(t *testing.T) {
+			got := hasNoiseSuffix(tt.colName)
+			if got != tt.want {
+				t.Errorf("hasNoiseSuffix(%q) = %v, want %v", tt.colName, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAnalyzeSchema_SkipsNoiseSuffix(t *testing.T) {
+	schema := &DatabaseSchema{
+		tables: map[string]*TableInfo{
+			"public.notifications": {
+				Schema:     "public",
+				Name:       "notifications",
+				PrimaryKey: []string{"id"},
+				Columns: map[string]*ColumnInfo{
+					"id":            {Name: "id", Type: "bigint", OrdinalPosition: 1, IsPrimaryKey: true},
+					"email_subject": {Name: "email_subject", Type: "character varying(255)", OrdinalPosition: 2},
+					"user_email":    {Name: "user_email", Type: "character varying(255)", OrdinalPosition: 3},
+				},
+			},
+		},
+	}
+
+	result := AnalyzeSchema(schema, []string{"public.notifications"}, ConfidenceLow)
+	matches := result.Matches["public.notifications"]
+
+	for _, m := range matches {
+		if m.Column == "email_subject" {
+			t.Error("email_subject should be skipped (noise suffix 'subject')")
+		}
+	}
+
+	found := false
+	for _, m := range matches {
+		if m.Column == "user_email" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("user_email should still be detected as PII")
+	}
+}
+
+func TestAnalyzeSchema_NoiseSuffix_SingleWord(t *testing.T) {
+	schema := &DatabaseSchema{
+		tables: map[string]*TableInfo{
+			"public.users": {
+				Schema:     "public",
+				Name:       "users",
+				PrimaryKey: []string{"id"},
+				Columns: map[string]*ColumnInfo{
+					"id":    {Name: "id", Type: "bigint", OrdinalPosition: 1, IsPrimaryKey: true},
+					"email": {Name: "email", Type: "character varying(255)", OrdinalPosition: 2},
+				},
+			},
+		},
+	}
+
+	result := AnalyzeSchema(schema, []string{"public.users"}, ConfidenceLow)
+	found := false
+	for _, m := range result.Matches["public.users"] {
+		if m.Column == "email" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("single-word 'email' should still be detected")
+	}
+}
+
+func TestAnalyzeSchema_NoiseSuffix_PreservesCompound(t *testing.T) {
+	schema := &DatabaseSchema{
+		tables: map[string]*TableInfo{
+			"public.users": {
+				Schema:     "public",
+				Name:       "users",
+				PrimaryKey: []string{"id"},
+				Columns: map[string]*ColumnInfo{
+					"id":            {Name: "id", Type: "bigint", OrdinalPosition: 1, IsPrimaryKey: true},
+					"email_address": {Name: "email_address", Type: "character varying(255)", OrdinalPosition: 2},
+				},
+			},
+		},
+	}
+
+	result := AnalyzeSchema(schema, []string{"public.users"}, ConfidenceLow)
+	found := false
+	for _, m := range result.Matches["public.users"] {
+		if m.Column == "email_address" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("email_address should still be detected (last word 'address' is not a noise suffix)")
+	}
+}
+
 func TestParseConfidence_Invalid(t *testing.T) {
 	_, err := ParseConfidence("invalid")
 	if err == nil {
