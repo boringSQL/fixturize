@@ -30,7 +30,8 @@ type (
 		Include             []string `yaml:"include"`
 		Exclude             []string `yaml:"exclude"`
 		MaskPolicies        []string `yaml:"mask_policies"`
-		Masks               []string `yaml:"masks"`
+		Masks               []string          `yaml:"masks"`
+		Filters             map[string]string `yaml:"filters"`
 	}
 
 	ApplyProfile struct {

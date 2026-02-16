@@ -321,6 +321,10 @@ func (e *Extractor) extractChildren() (bool, error) {
 					childFKCols, tuples)
 			}
 
+			if filterExpr, ok := e.filters[childTable]; ok {
+				query += fmt.Sprintf(" AND (%s)", filterExpr)
+			}
+
 			if e.options.Limit > 0 {
 				query += fmt.Sprintf(" LIMIT %d", e.options.Limit)
 			}
@@ -417,6 +421,10 @@ func (e *Extractor) extractSelfReferencing(table string) error {
 			}
 			query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ANY($1) AND %s IS NOT NULL",
 				selfCols, QuoteQualifiedTable(table), QuoteIdent(fk.ColumnName), QuoteIdent(fk.ColumnName))
+
+			if filterExpr, ok := e.filters[table]; ok {
+				query += fmt.Sprintf(" AND (%s)", filterExpr)
+			}
 
 			rows, err := e.tx.Query(query, pkValues)
 			if err != nil {

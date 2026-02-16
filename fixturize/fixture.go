@@ -16,6 +16,7 @@ type (
 		ExtractedAt     time.Time `json:"extracted_at"`
 		Root            string    `json:"root"`
 		MasksApplied    []string  `json:"masks_applied,omitempty"`
+		FiltersApplied  []string  `json:"filters_applied,omitempty"`
 		UntouchedTables []string  `json:"untouched_tables,omitempty"`
 	}
 
@@ -26,12 +27,13 @@ type (
 	}
 )
 
-func NewFixture(root string, masks []string) *Fixture {
+func NewFixture(root string, masks, filters []string) *Fixture {
 	return &Fixture{
 		Meta: FixtureMeta{
-			ExtractedAt:  time.Now().UTC(),
-			Root:         root,
-			MasksApplied: masks,
+			ExtractedAt:    time.Now().UTC(),
+			Root:           root,
+			MasksApplied:   masks,
+			FiltersApplied: filters,
 		},
 		Tables: make(map[string]*FixtureTable),
 	}

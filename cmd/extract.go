@@ -60,6 +60,7 @@ Examples:
 	extractInclude             string
 	extractExclude             string
 	extractMask                []string
+	extractFilter              []string
 	extractStatementTimeout    int
 	extractTransaction         bool
 	extractOnConflictDoNothing bool
@@ -80,6 +81,7 @@ func init() {
 	extractCmd.Flags().StringVar(&extractInclude, "include", "", "Extra tables to include (comma-separated)")
 	extractCmd.Flags().StringVar(&extractExclude, "exclude", "", "Tables to skip (comma-separated)")
 	extractCmd.Flags().StringArrayVar(&extractMask, "mask", nil, "Mask column with SQL expression (table.column=expr, repeatable)")
+	extractCmd.Flags().StringArrayVar(&extractFilter, "filter", nil, "Per-table WHERE condition (table=expr, repeatable)")
 	extractCmd.Flags().IntVar(&extractStatementTimeout, "statement-timeout", 0, "Per-statement timeout in seconds")
 	extractCmd.Flags().BoolVar(&extractTransaction, "transaction", false, "Wrap SQL output in BEGIN/COMMIT")
 	extractCmd.Flags().BoolVar(&extractOnConflictDoNothing, "on-conflict-do-nothing", false, "Append ON CONFLICT DO NOTHING to SQL INSERTs")
@@ -92,7 +94,7 @@ func expandEnvVars(s string) string {
 }
 
 func runExtract(cmd *cobra.Command, args []string) error {
-	conn, root, schema, output, limit, depth, include, exclude, masks, statementTimeout := mergeExtractConfig(cmd)
+	conn, root, schema, output, limit, depth, include, exclude, masks, filters, statementTimeout := mergeExtractConfig(cmd)
 	format, transaction, onConflictDN := mergeFormatConfig(cmd)
 
 	if conn == "" {
@@ -122,6 +124,7 @@ func runExtract(cmd *cobra.Command, args []string) error {
 		Include:          include,
 		Exclude:          exclude,
 		Mask:             masks,
+		Filter:           filters,
 		StatementTimeout: statementTimeout,
 		DryRun:           extractDryRun,
 		Verbose:          extractVerbose,
@@ -182,7 +185,7 @@ func runExtract(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func mergeExtractConfig(cmd *cobra.Command) (conn, root, schema, output string, limit, depth int, include, exclude, masks []string, statementTimeout int) {
+func mergeExtractConfig(cmd *cobra.Command) (conn, root, schema, output string, limit, depth int, include, exclude, masks, filters []string, statementTimeout int) {
 	conn = extractConn
 	root = extractRoot
 	schema = extractSchema
@@ -192,6 +195,7 @@ func mergeExtractConfig(cmd *cobra.Command) (conn, root, schema, output string, 
 	include = parseCommaSeparated(extractInclude)
 	exclude = parseCommaSeparated(extractExclude)
 	masks = extractMask
+	filters = extractFilter
 	statementTimeout = extractStatementTimeout
 
 	if loadedProfile == nil {
@@ -245,6 +249,11 @@ func mergeExtractConfig(cmd *cobra.Command) (conn, root, schema, output string, 
 	}
 	if !cmd.Flags().Changed("mask") && len(masks) == 0 {
 		masks = p.ResolveMasks()
+	}
+	if !cmd.Flags().Changed("filter") && len(filters) == 0 {
+		for table, expr := range p.Extract.Filters {
+			filters = append(filters, table+"="+expr)
+		}
 	}
 
 	return

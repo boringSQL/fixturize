@@ -18,6 +18,7 @@ type (
 		Include          []string
 		Exclude          []string
 		Mask             []string
+		Filter           []string
 		StatementTimeout int
 		DryRun           bool
 		Verbose          bool
@@ -47,6 +48,7 @@ type (
 		generatedCols   map[string]map[string]bool
 		identityTables  map[string]bool
 		masks           map[string]map[string]string
+		filters         map[string]string
 		columnOrders    map[string][]string
 		warnings        []string
 		warnedParentFKs map[string]bool
@@ -80,6 +82,7 @@ func NewExtractor(db *sql.DB, options *ExtractOptions) *Extractor {
 		generatedCols:   make(map[string]map[string]bool),
 		identityTables:  make(map[string]bool),
 		masks:           make(map[string]map[string]string),
+		filters:         make(map[string]string),
 		columnOrders:    make(map[string][]string),
 		warnedParentFKs: make(map[string]bool),
 		downwardTables:  make(map[string]bool),
@@ -97,6 +100,9 @@ func (e *Extractor) Extract() (*ExtractResult, error) {
 	fmt.Printf("%d table(s)\n", len(schema.GetTables()))
 
 	if err := e.parseMasks(); err != nil {
+		return nil, err
+	}
+	if err := e.parseFilters(); err != nil {
 		return nil, err
 	}
 
@@ -295,6 +301,29 @@ func (e *Extractor) parseMasks() error {
 	return nil
 }
 
+func (e *Extractor) parseFilters() error {
+	for _, spec := range e.options.Filter {
+		eqIdx := strings.Index(spec, "=")
+		if eqIdx == -1 {
+			return fmt.Errorf("invalid --filter format %q, expected table=expression", spec)
+		}
+		rawTable := spec[:eqIdx]
+		expr := spec[eqIdx+1:]
+		if expr == "" {
+			return fmt.Errorf("invalid --filter format %q, expression cannot be empty", spec)
+		}
+
+		tableName, err := e.resolveTableName(rawTable)
+		if err != nil {
+			return fmt.Errorf("--filter table %q: %w", rawTable, err)
+		}
+
+		e.filters[tableName] = expr
+		fmt.Printf("Filter: %s = %s\n", shortName(tableName), expr)
+	}
+	return nil
+}
+
 func (e *Extractor) selectColumns(tableName string) (string, error) {
 	tableMasks := e.masks[tableName]
 	genCols := e.generatedCols[tableName]
@@ -378,7 +407,12 @@ func (e *Extractor) buildFixture(orderedTables []string) *Fixture {
 		appliedMasks = append(appliedMasks, m)
 	}
 
-	fixture := NewFixture(e.options.Root, appliedMasks)
+	var appliedFilters []string
+	for _, f := range e.options.Filter {
+		appliedFilters = append(appliedFilters, f)
+	}
+
+	fixture := NewFixture(e.options.Root, appliedMasks, appliedFilters)
 	fixture.TableOrder = orderedTables
 
 	for _, tableName := range orderedTables {
