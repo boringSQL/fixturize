@@ -1,13 +1,13 @@
 # fixturize
 
-Extract consistent data sub-graphs from a PostgreSQL database and apply them elsewhere. Built for seeding test databases with real-world data while keeping referential integrity intact.
+Subset a PostgreSQL database and anonymize sensitive columns in one step. Extract referentially-intact slices of production data, mask PII, and seed dev, test, or staging environments.
 
 ## What it does
 
-1. **`extract`** - Pick a root table and (optional) filtering clauses. Fixturize will follow foreign keys in both directions (parents and children) to collect a self-contained snapshot of the data.
+1. **`extract`** - Pick a root table and optional filtering clauses. Fixturize follows foreign keys in both directions (parents and children) to collect a referentially-intact subset of the data. Supports composite FKs, self-referencing tables, and circular dependencies.
 2. **`apply`** - Load the snapshot into another database. Tables are inserted in FK-dependency order, constraints are deferred.
 3. **`inspect`** - Display schema structure with FK relationships without extracting any data.
-4. **`analyze`** - Auto-detect PII columns by scanning column names and types, and suggest mask expressions.
+4. **`analyze`** - Discover PII columns automatically by scanning column names and types. Covers emails, names, phones, addresses, financial data, API keys, and more. Outputs ready-to-use `--mask` expressions.
 
 ## Install
 
@@ -38,9 +38,16 @@ fixturize extract --connection "$DB" \
 # preview without writing a file
 fixturize extract --connection "$DB" \
   --root "users LIMIT 5" --dry-run
+
+# only completed orders for each org
+fixturize extract --connection "$DB" \
+  --root "organizations WHERE id = 42" \
+  --filter "orders=status='completed'"
 ```
 
 The `--root` flag accepts any valid SQL fragment after the table name: `WHERE`, `ORDER BY`, `LIMIT`.
+
+`--filter` adds a WHERE condition to a specific child table during traversal (repeatable). Format: `table=condition`.
 
 `--include` pulls entire tables (all rows) - useful for enums and lookups that aren't FK-linked.
 
@@ -110,9 +117,9 @@ export DATABASE_URL="postgresql://user:pass@localhost/mydb"
 fixturize extract --root "users LIMIT 10"
 ```
 
-## Masking
+## Data Masking
 
-Replace sensitive columns with SQL expressions during extraction. The expression runs in the SELECT and can reference the same row:
+Replace PII and sensitive columns with SQL expressions during extraction (static data masking — the fixture never contains real values). Expressions run in the SELECT and can reference the same row:
 
 ```bash
 fixturize extract --connection "$DB" \
@@ -130,9 +137,67 @@ Since the expression runs as raw SQL in the SELECT, you can use `CASE` to preser
 --mask "users.email=CASE WHEN email IS NOT NULL THEN 'user_' || id || '@test.com' END"
 ```
 
-Masks are recorded in the fixture metadata so you know what was scrubbed.
+Masks are recorded in the fixture metadata (columns masked, expressions used, extraction timestamp) so you have an audit trail of what was anonymized.
 
 Use `fixturize analyze` to auto-detect which columns need masking and get suggested expressions.
+
+## Profiles
+
+Store default flags in a YAML file instead of typing them every time. Fixturize auto-loads `.fixturize.yaml` from the current directory, or you can point to a specific file with `--profile`:
+
+```bash
+fixturize extract --profile staging.yaml --root "users LIMIT 5"
+```
+
+CLI flags always take precedence over profile values.
+
+### Example profile
+
+```yaml
+connection: "postgresql://${DB_USER}:${DB_PASS}@localhost/mydb"
+schema: public
+
+masks:
+  pii:
+    - "users.email='user_' || id || '@test.com'"
+    - "users.first_name='First' || id"
+    - "users.last_name='Last' || id"
+  billing:
+    - "billing.cards.number='4111111111111111'"
+
+extract:
+  root: "organizations WHERE id = 42"
+  output: fixtures/org-42.json
+  format: json
+  limit: 500
+  depth: 0
+  statement_timeout: 60
+  transaction: false
+  on_conflict_do_nothing: false
+  include:
+    - roles
+    - permissions
+  exclude:
+    - audit_log
+    - event_log
+  mask_policies:
+    - pii
+    - billing
+  masks:
+    - "contacts.phone='+1555' || LPAD((id % 10000000)::text, 7, '0')"
+
+apply:
+  force: false
+  disable_triggers: false
+  sync_sequences: true
+```
+
+### How it works
+
+- `.fixturize.yaml` in the working directory is loaded automatically. Pass `--profile path/to/file.yaml` to use a different file.
+- Environment variables in the `connection` field are expanded (`$VAR` and `${VAR}` syntax). Unresolved variables cause an error so you don't accidentally connect with a blank password.
+- `masks` at the top level defines reusable **mask policies** - named groups of mask expressions. Reference them from `extract.mask_policies` to compose sets of masks without repeating yourself. Inline `extract.masks` are appended after policy masks.
+- All fields are optional. Only set what you need - everything else falls back to CLI defaults.
 
 ## Precautions
 
@@ -140,5 +205,5 @@ Use `fixturize analyze` to auto-detect which columns need masking and get sugges
 - `--force` on apply **truncates** target tables before insert. Don't point it at production.
 - Circular FK dependencies are detected and warned about. The tool handles them via deferred constraints, but review the output.
 - generated/identity columns are excluded from extraction and use `OVERRIDING SYSTEM VALUE` on apply.
-- Always mask PII before sharing fixtures across environments.
+- Always mask PII before sharing fixtures across environments, staging databases, or CI/CD pipelines.
 
