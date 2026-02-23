@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"bufio"
 	"io"
 	"os"
 	"strconv"
@@ -125,15 +126,17 @@ func (a *Applier) Apply(ctx context.Context, fixture *Fixture) (*ApplyResult, er
 
 			pr, pw := io.Pipe()
 			go func() {
+				bw := bufio.NewWriterSize(pw, 64*1024)
 				for _, row := range tableData.Rows {
 					for i, v := range row {
 						if i > 0 {
-							fmt.Fprint(pw, "\t")
+							bw.WriteByte('\t')
 						}
-						fmt.Fprint(pw, formatCopyValue(v))
+						bw.WriteString(formatCopyValue(v))
 					}
-					fmt.Fprint(pw, "\n")
+					bw.WriteByte('\n')
 				}
+				bw.Flush()
 				pw.Close()
 			}()
 
