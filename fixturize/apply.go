@@ -1,11 +1,11 @@
 package fixturize
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -123,20 +123,23 @@ func (a *Applier) Apply(ctx context.Context, fixture *Fixture) (*ApplyResult, er
 				pgx.Identifier{schemaName, table}.Sanitize(),
 				strings.Join(quotedCols, ", "))
 
-			var buf bytes.Buffer
-			for _, row := range tableData.Rows {
-				for i, v := range row {
-					if i > 0 {
-						buf.WriteByte('\t')
+			pr, pw := io.Pipe()
+			go func() {
+				for _, row := range tableData.Rows {
+					for i, v := range row {
+						if i > 0 {
+							fmt.Fprint(pw, "\t")
+						}
+						fmt.Fprint(pw, formatCopyValue(v))
 					}
-					buf.WriteString(formatCopyValue(v))
+					fmt.Fprint(pw, "\n")
 				}
-				buf.WriteByte('\n')
-			}
+				pw.Close()
+			}()
 
 			// tx.Conn().PgConn().CopyFrom to be used instead high-level tx.CopyFrom
 			// whcih uses binary protocol and running into the serialization issues
-			tag, err := tx.Conn().PgConn().CopyFrom(ctx, &buf, copySQL)
+			tag, err := tx.Conn().PgConn().CopyFrom(ctx, pr, copySQL)
 			copied := tag.RowsAffected()
 			if err != nil {
 				fmt.Println("FAILED")
