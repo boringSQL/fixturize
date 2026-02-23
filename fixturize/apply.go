@@ -15,6 +15,9 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
+// buffer for COPY pipe writes
+const copyBufSize = 64 * 1024
+
 type (
 	ApplyOptions struct {
 		Connection      string
@@ -126,7 +129,7 @@ func (a *Applier) Apply(ctx context.Context, fixture *Fixture) (*ApplyResult, er
 
 			pr, pw := io.Pipe()
 			go func() {
-				bw := bufio.NewWriterSize(pw, 64*1024)
+				bw := bufio.NewWriterSize(pw, copyBufSize)
 				for _, row := range tableData.Rows {
 					for i, v := range row {
 						if i > 0 {
