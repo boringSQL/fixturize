@@ -272,7 +272,7 @@ func extractFixture(t *testing.T, db *sql.DB, opts *ExtractOptions) *ExtractResu
 func applyFixture(t *testing.T, db *sql.DB, fixture *Fixture, opts *ApplyOptions) *ApplyResult {
 	t.Helper()
 	a := NewApplier(db, opts)
-	result, err := a.Apply(fixture)
+	result, err := a.Apply(context.Background(), fixture)
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
