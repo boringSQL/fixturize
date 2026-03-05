@@ -1,4 +1,4 @@
-.PHONY: build test test-all test-integration clean
+.PHONY: build test test-all test-integration clean try try-large try-status try-shell try-down
 
 build:
 	go build -o bin/fixturize ./cmd/fixturize
@@ -13,3 +13,19 @@ test-integration:
 
 clean:
 	rm -rf bin/
+
+# Docker try workflow
+try:
+	$(MAKE) -C try
+
+try-large:
+	$(MAKE) -C try large
+
+try-status:
+	$(MAKE) -C try status
+
+try-shell:
+	$(MAKE) -C try shell
+
+try-down:
+	$(MAKE) -C try down

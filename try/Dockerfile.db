@@ -1,0 +1,13 @@
+FROM postgres:17
+
+ENV POSTGRES_USER=demo
+ENV POSTGRES_PASSWORD=demo
+ENV POSTGRES_DB=fixturize_demo
+
+COPY lighting/schema.sql /docker-entrypoint-initdb.d/01-schema.sql
+COPY try/seed-medium.sql /docker-entrypoint-initdb.d/02-seed.sql
+
+RUN /usr/local/bin/docker-entrypoint.sh postgres & \
+    until pg_isready -U demo; do sleep 1; done && \
+    until psql -U demo -d fixturize_demo -c "SELECT count(*) FROM audit_logs" 2>/dev/null | grep -q '[1-9]'; do sleep 2; done && \
+    gosu postgres pg_ctl -D /var/lib/postgresql/data -m fast -w stop
