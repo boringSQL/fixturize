@@ -128,6 +128,21 @@ CREATE TABLE project_assignments (
     assignee TEXT NOT NULL,
     FOREIGN KEY (workspace_id, project_id) REFERENCES workspace_projects(workspace_id, project_id)
 );
+
+CREATE TABLE items (
+    id SERIAL PRIMARY KEY,
+    org_id INT NOT NULL REFERENCES organizations(id),
+    name TEXT NOT NULL,
+    UNIQUE (org_id, id)
+);
+
+CREATE TABLE item_notes (
+    id SERIAL PRIMARY KEY,
+    item_id INT NOT NULL REFERENCES items(id),
+    org_id INT NOT NULL,
+    body TEXT NOT NULL,
+    FOREIGN KEY (org_id, item_id) REFERENCES items(org_id, id)
+);
 `
 
 func TestMain(m *testing.M) {
@@ -180,7 +195,8 @@ func TestMain(m *testing.M) {
 
 var allTables = []string{
 	"audit_logs", "categories", "departments", "employees",
-	"events", "metrics", "organizations", "project_assignments",
+	"events", "item_notes", "items", "metrics",
+	"organizations", "project_assignments",
 	"projects", "task_comments", "tasks", "users",
 	"workspace_projects",
 }
@@ -219,6 +235,10 @@ func seedAll(t *testing.T, db *sql.DB) {
 		`SELECT setval('task_comments_id_seq', 3)`,
 		`INSERT INTO metrics (id, org_id, recorded_at, value) VALUES (1, 1, '2024-03-15', 100), (2, 1, '2024-09-20', 200), (3, 1, '2025-02-10', 300), (4, 2, '2024-06-01', 400)`,
 		`SELECT setval('metrics_id_seq', 4)`,
+		`INSERT INTO items (id, org_id, name) VALUES (1, 1, 'Item A'), (2, 1, 'Item B'), (3, 2, 'Item C')`,
+		`SELECT setval('items_id_seq', 3)`,
+		`INSERT INTO item_notes (id, item_id, org_id, body) VALUES (1, 1, 1, 'Note on A'), (2, 2, 1, 'Note on B'), (3, 3, 2, 'Note on C')`,
+		`SELECT setval('item_notes_id_seq', 3)`,
 	}
 	for _, q := range queries {
 		if _, err := db.Exec(q); err != nil {
@@ -1130,5 +1150,97 @@ func TestCompositeForeignKey(t *testing.T) {
 	}
 	if c := rowCount(t, testDB, "project_assignments"); c != 2 {
 		t.Errorf("expected 2 project_assignments after apply, got %d", c)
+	}
+}
+
+// TestDuplicateFKDedup verifies that when a child table has multiple FKs
+// pointing to the same parent (e.g. item_notes has both item_id->items.id and
+// (org_id,item_id)->items(org_id,id)), only one child query is executed and
+// the correct rows are extracted.
+func TestDuplicateFKDedup(t *testing.T) {
+	resetDB(t, testDB)
+	seedAll(t, testDB)
+
+	result := extractFixture(t, testDB, &ExtractOptions{
+		Root:   "organizations WHERE id = 1",
+		Schema: "public",
+	})
+	fixture := result.Fixture
+
+	items := fixture.Tables["public.items"]
+	if items == nil {
+		t.Fatal("missing public.items in fixture")
+	}
+	if len(items.Rows) != 2 {
+		t.Errorf("expected 2 item rows for org 1, got %d", len(items.Rows))
+	}
+
+	notes := fixture.Tables["public.item_notes"]
+	if notes == nil {
+		t.Fatal("missing public.item_notes in fixture")
+	}
+	if len(notes.Rows) != 2 {
+		t.Errorf("expected 2 item_notes for org 1, got %d", len(notes.Rows))
+	}
+
+	// Verify org 2 note is not present
+	bodyIdx := colIndex(notes, "body")
+	if bodyIdx >= 0 {
+		for _, row := range notes.Rows {
+			if fmt.Sprintf("%v", row[bodyIdx]) == "Note on C" {
+				t.Error("Note on C (org 2) should not be in fixture")
+			}
+		}
+	}
+
+	// Round-trip
+	resetDB(t, testDB)
+	applyFixture(t, testDB, fixture, &ApplyOptions{Force: true, SyncSequences: true})
+
+	if c := rowCount(t, testDB, "items"); c != 2 {
+		t.Errorf("expected 2 items after apply, got %d", c)
+	}
+	if c := rowCount(t, testDB, "item_notes"); c != 2 {
+		t.Errorf("expected 2 item_notes after apply, got %d", c)
+	}
+}
+
+// TestSeedTableSkip verifies that tables populated during --seed are not
+// re-queried as children of other seeded tables.
+func TestSeedTableSkip(t *testing.T) {
+	resetDB(t, testDB)
+	seedAll(t, testDB)
+
+	result := extractFixture(t, testDB, &ExtractOptions{
+		Seed:   "org_id=1",
+		Schema: "public",
+	})
+	fixture := result.Fixture
+
+	// items and item_notes both have org_id, so both are seeded directly.
+	// item_notes should NOT be re-queried as a child of items.
+	items := fixture.Tables["public.items"]
+	if items == nil {
+		t.Fatal("missing public.items in fixture")
+	}
+	if len(items.Rows) != 2 {
+		t.Errorf("expected 2 item rows, got %d", len(items.Rows))
+	}
+
+	notes := fixture.Tables["public.item_notes"]
+	if notes == nil {
+		t.Fatal("missing public.item_notes in fixture")
+	}
+	if len(notes.Rows) != 2 {
+		t.Errorf("expected 2 item_notes rows, got %d", len(notes.Rows))
+	}
+
+	// users seeded via org_id should still pull parent org
+	orgs := fixture.Tables["public.organizations"]
+	if orgs == nil {
+		t.Fatal("missing public.organizations in fixture (should be pulled as parent)")
+	}
+	if len(orgs.Rows) != 1 {
+		t.Errorf("expected 1 org row, got %d", len(orgs.Rows))
 	}
 }
