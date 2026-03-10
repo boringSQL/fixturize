@@ -5,6 +5,9 @@ import (
 	"strings"
 )
 
+// batchSize controls nested query size (for larger-tables)
+const batchSize = 10000
+
 func (e *Extractor) buildInvertedGraph() {
 	for _, tableName := range e.schema.GetTables() {
 		tableInfo, _ := e.schema.GetTable(tableName)
@@ -39,6 +42,25 @@ func (e *Extractor) extractRootRows(table, clause string) error {
 	return e.collectRows(table, rows)
 }
 
+func (e *Extractor) extractRootRowsWithArgs(table, clause string, args ...any) error {
+	cols, err := e.selectColumns(table)
+	if err != nil {
+		return err
+	}
+	query := fmt.Sprintf("SELECT %s FROM %s", cols, QuoteQualifiedTable(table))
+	if clause != "" {
+		query += " " + clause
+	}
+
+	rows, err := e.tx.Query(query, args...)
+	if err != nil {
+		return fmt.Errorf("query failed: %w", err)
+	}
+	defer rows.Close()
+
+	return e.collectRows(table, rows)
+}
+
 func (e *Extractor) extractAllRows(table string) error {
 	cols, err := e.selectColumns(table)
 	if err != nil {
@@ -53,6 +75,52 @@ func (e *Extractor) extractAllRows(table string) error {
 	defer rows.Close()
 
 	return e.collectRows(table, rows)
+}
+
+// queryAnyBatched executes baseQuery (containing = ANY($1)) in batches.
+func (e *Extractor) queryAnyBatched(table, baseQuery, suffix string, values []any) error {
+	for i := 0; i < len(values); i += batchSize {
+		end := i + batchSize
+		if end > len(values) {
+			end = len(values)
+		}
+		rows, err := e.tx.Query(baseQuery+suffix, values[i:end])
+		if err != nil {
+			return err
+		}
+		if err := e.collectRows(table, rows); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+	}
+	return nil
+}
+
+// queryTupleBatched executes composite-FK tuple queries in batches.
+func (e *Extractor) queryTupleBatched(table, selectClause, suffix string, cols []string, tuples [][]any) error {
+	colsPerTuple := len(cols)
+	chunk := batchSize / colsPerTuple
+	if chunk < 1 {
+		chunk = 1
+	}
+	for i := 0; i < len(tuples); i += chunk {
+		end := i + chunk
+		if end > len(tuples) {
+			end = len(tuples)
+		}
+		query, params := buildTupleQuery(selectClause, cols, tuples[i:end])
+		rows, err := e.tx.Query(query+suffix, params...)
+		if err != nil {
+			return err
+		}
+		if err := e.collectRows(table, rows); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+	}
+	return nil
 }
 
 func (e *Extractor) extractParents() (bool, error) {
@@ -101,9 +169,8 @@ func (e *Extractor) extractParents() (bool, error) {
 				return false, err
 			}
 
-			var query string
-			var queryParams []any
 			var tupleCount int
+			beforeCount := len(e.collected[parentTable])
 
 			if len(g.fks) == 1 {
 				// single-column FK: use = ANY($1) which PG handles efficiently
@@ -125,9 +192,11 @@ func (e *Extractor) extractParents() (bool, error) {
 				fkValues = uniqueValues(fkValues)
 				tupleCount = len(fkValues)
 
-				query = fmt.Sprintf("SELECT %s FROM %s WHERE %s = ANY($1)",
+				baseQuery := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ANY($1)",
 					parentCols, QuoteQualifiedTable(parentTable), QuoteIdent(fk.ReferencedColumn))
-				queryParams = []any{fkValues}
+				if err := e.queryAnyBatched(parentTable, baseQuery, "", fkValues); err != nil {
+					return false, fmt.Errorf("parent query for %s (constraint %s) failed: %w", parentTable, constraintName, err)
+				}
 			} else {
 				// composite FK: collect tuples and match with OR'd equality conditions
 				var tuples [][]any
@@ -157,24 +226,14 @@ func (e *Extractor) extractParents() (bool, error) {
 				for _, fk := range g.fks {
 					refCols = append(refCols, QuoteIdent(fk.ReferencedColumn))
 				}
-				query, queryParams = buildTupleQuery(
-					fmt.Sprintf("SELECT %s FROM %s", parentCols, QuoteQualifiedTable(parentTable)),
-					refCols, tuples)
+				selectClause := fmt.Sprintf("SELECT %s FROM %s", parentCols, QuoteQualifiedTable(parentTable))
+				if err := e.queryTupleBatched(parentTable, selectClause, "", refCols, tuples); err != nil {
+					return false, fmt.Errorf("parent query for %s (constraint %s) failed: %w", parentTable, constraintName, err)
+				}
 			}
-
-			rows, err := e.tx.Query(query, queryParams...)
-			if err != nil {
-				return false, fmt.Errorf("parent query for %s (constraint %s) failed: %w", parentTable, constraintName, err)
-			}
-
-			beforeCount := len(e.collected[parentTable])
-			if err := e.collectRows(parentTable, rows); err != nil {
-				rows.Close()
-				return false, err
-			}
-			rows.Close()
 
 			afterCount := len(e.collected[parentTable])
+
 			if afterCount > beforeCount {
 				foundNew = true
 				newRows := afterCount - beforeCount
@@ -212,6 +271,10 @@ func (e *Extractor) extractChildren() (bool, error) {
 		visited[t] = true
 		queue = append(queue, bfsItem{table: t, depth: 0})
 	}
+
+	// skip duplicate FKs between the same parent -> child table pair
+	type parentChildPair struct{ parent, child string }
+	queried := make(map[parentChildPair]bool)
 
 	for len(queue) > 0 {
 		item := queue[0]
@@ -252,6 +315,16 @@ func (e *Extractor) extractChildren() (bool, error) {
 				continue
 			}
 
+			if e.seededTables[childTable] {
+				continue
+			}
+
+			pair := parentChildPair{item.table, childTable}
+			if queried[pair] {
+				continue
+			}
+			queried[pair] = true
+
 			parentRows := e.collected[item.table]
 			if len(parentRows) == 0 {
 				continue
@@ -262,9 +335,16 @@ func (e *Extractor) extractChildren() (bool, error) {
 				return false, err
 			}
 
-			var query string
-			var queryParams []any
+			var suffix string
+			if filterExpr, ok := e.filters[childTable]; ok {
+				suffix += fmt.Sprintf(" AND (%s)", filterExpr)
+			}
+			if e.options.Limit > 0 {
+				suffix += fmt.Sprintf(" LIMIT %d", e.options.Limit)
+			}
+
 			var tupleCount int
+			beforeCount := len(e.collected[childTable])
 
 			if len(groupEdges) == 1 {
 				// single-column FK: use = ANY($1)
@@ -283,10 +363,12 @@ func (e *Extractor) extractChildren() (bool, error) {
 				pkValues = uniqueValues(pkValues)
 				tupleCount = len(pkValues)
 
-				query = fmt.Sprintf("SELECT %s FROM %s WHERE %s = ANY($1) AND %s IS NOT NULL",
+				baseQuery := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ANY($1) AND %s IS NOT NULL",
 					childSelectCols, QuoteQualifiedTable(childTable),
 					QuoteIdent(edge.ChildColumn), QuoteIdent(edge.ChildColumn))
-				queryParams = []any{pkValues}
+				if err := e.queryAnyBatched(childTable, baseQuery, suffix, pkValues); err != nil {
+					return false, fmt.Errorf("child query for %s failed: %w", childTable, err)
+				}
 			} else {
 				// composite FK: collect tuples and match with OR'd equality conditions
 				var tuples [][]any
@@ -316,30 +398,11 @@ func (e *Extractor) extractChildren() (bool, error) {
 				for _, edge := range groupEdges {
 					childFKCols = append(childFKCols, QuoteIdent(edge.ChildColumn))
 				}
-				query, queryParams = buildTupleQuery(
-					fmt.Sprintf("SELECT %s FROM %s", childSelectCols, QuoteQualifiedTable(childTable)),
-					childFKCols, tuples)
+				selectClause := fmt.Sprintf("SELECT %s FROM %s", childSelectCols, QuoteQualifiedTable(childTable))
+				if err := e.queryTupleBatched(childTable, selectClause, suffix, childFKCols, tuples); err != nil {
+					return false, fmt.Errorf("child query for %s failed: %w", childTable, err)
+				}
 			}
-
-			if filterExpr, ok := e.filters[childTable]; ok {
-				query += fmt.Sprintf(" AND (%s)", filterExpr)
-			}
-
-			if e.options.Limit > 0 {
-				query += fmt.Sprintf(" LIMIT %d", e.options.Limit)
-			}
-
-			rows, err := e.tx.Query(query, queryParams...)
-			if err != nil {
-				return false, fmt.Errorf("child query for %s failed: %w", childTable, err)
-			}
-
-			beforeCount := len(e.collected[childTable])
-			if err := e.collectRows(childTable, rows); err != nil {
-				rows.Close()
-				return false, err
-			}
-			rows.Close()
 
 			afterCount := len(e.collected[childTable])
 
@@ -368,7 +431,9 @@ func (e *Extractor) extractChildren() (bool, error) {
 
 			if !visited[childTable] {
 				visited[childTable] = true
-				e.downwardTables[childTable] = true
+				if afterCount > 0 {
+					e.downwardTables[childTable] = true
+				}
 				queue = append(queue, bfsItem{table: childTable, depth: item.depth + 1})
 			}
 		}
@@ -419,24 +484,18 @@ func (e *Extractor) extractSelfReferencing(table string) error {
 			if err != nil {
 				return err
 			}
-			query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ANY($1) AND %s IS NOT NULL",
+			baseQuery := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ANY($1) AND %s IS NOT NULL",
 				selfCols, QuoteQualifiedTable(table), QuoteIdent(fk.ColumnName), QuoteIdent(fk.ColumnName))
 
+			var suffix string
 			if filterExpr, ok := e.filters[table]; ok {
-				query += fmt.Sprintf(" AND (%s)", filterExpr)
-			}
-
-			rows, err := e.tx.Query(query, pkValues)
-			if err != nil {
-				return fmt.Errorf("self-referencing query for %s failed: %w", table, err)
+				suffix = fmt.Sprintf(" AND (%s)", filterExpr)
 			}
 
 			before := len(e.collected[table])
-			if err := e.collectRows(table, rows); err != nil {
-				rows.Close()
-				return err
+			if err := e.queryAnyBatched(table, baseQuery, suffix, pkValues); err != nil {
+				return fmt.Errorf("self-referencing query for %s failed: %w", table, err)
 			}
-			rows.Close()
 
 			if len(e.collected[table]) > before {
 				foundAny = true

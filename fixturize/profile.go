@@ -20,6 +20,7 @@ type (
 
 	ExtractProfile struct {
 		Root                string   `yaml:"root"`
+		Seed                string   `yaml:"seed"`
 		Output              string   `yaml:"output"`
 		Format              string   `yaml:"format"`
 		Limit               int      `yaml:"limit"`

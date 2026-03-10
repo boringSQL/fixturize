@@ -11,6 +11,7 @@ type (
 	ExtractOptions struct {
 		Connection       string
 		Root             string
+		Seed             string
 		Schema           string
 		Output           string
 		Limit            int
@@ -53,6 +54,7 @@ type (
 		warnings        []string
 		warnedParentFKs map[string]bool
 		downwardTables  map[string]bool // tables we found by going downward (root + children)
+		seededTables    map[string]bool // tables populated in the seed phase (skip redundant child queries)
 		limitReached    map[string]bool // tables where we already hit --limit so they are not queried again
 	}
 
@@ -86,6 +88,7 @@ func NewExtractor(db *sql.DB, options *ExtractOptions) *Extractor {
 		columnOrders:    make(map[string][]string),
 		warnedParentFKs: make(map[string]bool),
 		downwardTables:  make(map[string]bool),
+		seededTables:    make(map[string]bool),
 		limitReached:    make(map[string]bool),
 	}
 }
@@ -131,40 +134,46 @@ func (e *Extractor) Extract() (*ExtractResult, error) {
 
 	e.buildInvertedGraph()
 
-	rootTable, clause, err := e.parseRootSpec()
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse root spec: %w", err)
-	}
+	if e.options.Seed != "" {
+		if err := e.extractSeedRoots(); err != nil {
+			return nil, fmt.Errorf("seed extraction failed: %w", err)
+		}
+	} else {
+		rootTable, clause, err := e.parseRootSpec()
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse root spec: %w", err)
+		}
 
-	rootCols, err := e.selectColumns(rootTable)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build column list for %s: %w", rootTable, err)
-	}
-	rootQuery := fmt.Sprintf("SELECT %s FROM %s", rootCols, QuoteQualifiedTable(rootTable))
-	if clause != "" {
-		rootQuery += " " + clause
-	}
-	fmt.Printf("Root query: %s\n", rootQuery)
+		rootCols, err := e.selectColumns(rootTable)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build column list for %s: %w", rootTable, err)
+		}
+		rootQuery := fmt.Sprintf("SELECT %s FROM %s", rootCols, QuoteQualifiedTable(rootTable))
+		if clause != "" {
+			rootQuery += " " + clause
+		}
+		fmt.Printf("Root query: %s\n", rootQuery)
 
-	fmt.Print("Validating query... ")
-	if _, err := e.tx.Exec("EXPLAIN " + rootQuery); err != nil {
-		fmt.Println("FAILED")
-		return nil, fmt.Errorf("invalid root query:\n  %s\n  %w", rootQuery, err)
-	}
-	fmt.Println("OK")
+		fmt.Print("Validating query... ")
+		if _, err := e.tx.Exec("EXPLAIN " + rootQuery); err != nil {
+			fmt.Println("FAILED")
+			return nil, fmt.Errorf("invalid root query:\n  %s\n  %w", rootQuery, err)
+		}
+		fmt.Println("OK")
 
-	fmt.Printf("Querying %s... ", shortName(rootTable))
-	if err := e.extractRootRows(rootTable, clause); err != nil {
-		return nil, fmt.Errorf("root query failed:\n  %s\n  %w", rootQuery, err)
-	}
-	e.downwardTables[rootTable] = true
+		fmt.Printf("Querying %s... ", shortName(rootTable))
+		if err := e.extractRootRows(rootTable, clause); err != nil {
+			return nil, fmt.Errorf("root query failed:\n  %s\n  %w", rootQuery, err)
+		}
+		e.downwardTables[rootTable] = true
 
-	rootCount := len(e.collected[rootTable])
-	if rootCount == 0 {
-		fmt.Println("0 rows")
-		return nil, fmt.Errorf("no rows matched root query:\n  %s", rootQuery)
+		rootCount := len(e.collected[rootTable])
+		if rootCount == 0 {
+			fmt.Println("0 rows")
+			return nil, fmt.Errorf("no rows matched root query:\n  %s", rootQuery)
+		}
+		fmt.Printf("%d row(s)\n", rootCount)
 	}
-	fmt.Printf("%d row(s)\n", rootCount)
 
 	for _, incl := range e.options.Include {
 		tableName, err := e.resolveTableName(incl)
@@ -178,19 +187,17 @@ func (e *Extractor) Extract() (*ExtractResult, error) {
 		fmt.Printf("  + %s... %d row(s) (included)\n", shortName(tableName), len(e.collected[tableName]))
 	}
 
-	// 1st pass: walk all child edges from the root; this discovers
-	// the full subgraph of data that "belongs" to the root entity.
-	if _, err := e.extractChildren(); err != nil {
-		return nil, fmt.Errorf("failed to extract children: %w", err)
-	}
-
-	// 2nd pass: fetch any parent rows needed to maintain FK integrity.
+	// extract children then parents repeatedly until no new rows found
 	for iteration := 0; iteration < maxTraversalIterations; iteration++ {
+		newChildren, err := e.extractChildren()
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract children: %w", err)
+		}
 		newParents, err := e.extractParents()
 		if err != nil {
 			return nil, fmt.Errorf("failed to extract parents: %w", err)
 		}
-		if !newParents {
+		if !newChildren && !newParents {
 			break
 		}
 	}
@@ -243,6 +250,65 @@ func (e *Extractor) parseRootSpec() (table, clause string, err error) {
 	}
 
 	return tableName, clause, nil
+}
+
+func (e *Extractor) extractSeedRoots() error {
+	eqIdx := strings.Index(e.options.Seed, "=")
+	if eqIdx == -1 {
+		return fmt.Errorf("invalid --seed format %q, expected column=value", e.options.Seed)
+	}
+	column := strings.TrimSpace(e.options.Seed[:eqIdx])
+	value := strings.TrimSpace(e.options.Seed[eqIdx+1:])
+	if column == "" || value == "" {
+		return fmt.Errorf("invalid --seed format %q, both column and value are required", e.options.Seed)
+	}
+
+	var seedTables []string
+	for _, tableName := range e.schema.GetTables() {
+		if e.excludeSet[shortName(tableName)] || e.excludeSet[tableName] {
+			continue
+		}
+		tableInfo, _ := e.schema.GetTable(tableName)
+		if tableInfo == nil {
+			continue
+		}
+		if _, ok := tableInfo.Columns[column]; ok {
+			seedTables = append(seedTables, tableName)
+		}
+	}
+
+	if len(seedTables) == 0 {
+		return fmt.Errorf("no tables found with column %q", column)
+	}
+
+	sort.Strings(seedTables)
+
+	var names []string
+	for _, t := range seedTables {
+		names = append(names, shortName(t))
+	}
+	fmt.Printf("Seed tables: %s (%d tables with %s column)\n", strings.Join(names, ", "), len(seedTables), column)
+
+	totalRows := 0
+	for _, tableName := range seedTables {
+		clause := fmt.Sprintf("WHERE %s = $1", QuoteIdent(column))
+		if err := e.extractRootRowsWithArgs(tableName, clause, value); err != nil {
+			return fmt.Errorf("seed query on %s failed: %w", shortName(tableName), err)
+		}
+		count := len(e.collected[tableName])
+		if count > 0 {
+			e.downwardTables[tableName] = true
+			e.seededTables[tableName] = true
+			fmt.Printf("  %s... %d row(s)\n", shortName(tableName), count)
+			totalRows += count
+		}
+	}
+
+	if totalRows == 0 {
+		return fmt.Errorf("no rows matched seed %s=%s in any table", column, value)
+	}
+
+	return nil
 }
 
 func (e *Extractor) resolveTableName(name string) (string, error) {
@@ -412,7 +478,11 @@ func (e *Extractor) buildFixture(orderedTables []string) *Fixture {
 		appliedFilters = append(appliedFilters, f)
 	}
 
-	fixture := NewFixture(e.options.Root, appliedMasks, appliedFilters)
+	root := e.options.Root
+	if e.options.Seed != "" {
+		root = "seed:" + e.options.Seed
+	}
+	fixture := NewFixture(root, appliedMasks, appliedFilters)
 	fixture.TableOrder = orderedTables
 
 	for _, tableName := range orderedTables {

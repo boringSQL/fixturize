@@ -52,6 +52,7 @@ Examples:
 
 	extractConn                string
 	extractRoot                string
+	extractSeed                string
 	extractSchema              string
 	extractOutput              string
 	extractFormat              string
@@ -73,6 +74,7 @@ func init() {
 
 	extractCmd.Flags().StringVar(&extractConn, "connection", "", "PostgreSQL connection string")
 	extractCmd.Flags().StringVar(&extractRoot, "root", "", "Root table + optional WHERE/ORDER BY/LIMIT")
+	extractCmd.Flags().StringVar(&extractSeed, "seed", "", "Seed column=value to discover and extract all matching tables (mutually exclusive with --root)")
 	extractCmd.Flags().StringVar(&extractSchema, "schema", "", "Default schema for unqualified names")
 	extractCmd.Flags().StringVarP(&extractOutput, "output", "o", "", "Output file path (default: extracted.json or extracted.sql)")
 	extractCmd.Flags().StringVar(&extractFormat, "format", "json", "Output format: json or sql")
@@ -94,7 +96,7 @@ func expandEnvVars(s string) string {
 }
 
 func runExtract(cmd *cobra.Command, args []string) error {
-	conn, root, schema, output, limit, depth, include, exclude, masks, filters, statementTimeout := mergeExtractConfig(cmd)
+	conn, root, seed, schema, output, limit, depth, include, exclude, masks, filters, statementTimeout := mergeExtractConfig(cmd)
 	format, transaction, onConflictDN := mergeFormatConfig(cmd)
 
 	if conn == "" {
@@ -103,8 +105,11 @@ func runExtract(cmd *cobra.Command, args []string) error {
 	if conn == "" {
 		return fmt.Errorf("connection string is required (use --connection, DATABASE_URL env var, or profile)")
 	}
-	if root == "" {
-		return fmt.Errorf("root is required (use --root or profile)")
+	if root != "" && seed != "" {
+		return fmt.Errorf("--root and --seed are mutually exclusive")
+	}
+	if root == "" && seed == "" {
+		return fmt.Errorf("either --root or --seed is required")
 	}
 
 	conn = expandEnvVars(conn)
@@ -117,6 +122,7 @@ func runExtract(cmd *cobra.Command, args []string) error {
 	options := &fixturize.ExtractOptions{
 		Connection:       conn,
 		Root:             root,
+		Seed:             seed,
 		Schema:           schema,
 		Output:           output,
 		Limit:            limit,
@@ -185,9 +191,10 @@ func runExtract(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func mergeExtractConfig(cmd *cobra.Command) (conn, root, schema, output string, limit, depth int, include, exclude, masks, filters []string, statementTimeout int) {
+func mergeExtractConfig(cmd *cobra.Command) (conn, root, seed, schema, output string, limit, depth int, include, exclude, masks, filters []string, statementTimeout int) {
 	conn = extractConn
 	root = extractRoot
+	seed = extractSeed
 	schema = extractSchema
 	output = extractOutput
 	limit = extractLimit
@@ -215,6 +222,9 @@ func mergeExtractConfig(cmd *cobra.Command) (conn, root, schema, output string, 
 	}
 	if !cmd.Flags().Changed("root") && root == "" {
 		root = p.Extract.Root
+	}
+	if !cmd.Flags().Changed("seed") && seed == "" {
+		seed = p.Extract.Seed
 	}
 	if !cmd.Flags().Changed("schema") {
 		if schema == "" {
