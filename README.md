@@ -199,6 +199,40 @@ apply:
 - `masks` at the top level defines reusable **mask policies** - named groups of mask expressions. Reference them from `extract.mask_policies` to compose sets of masks without repeating yourself. Inline `extract.masks` are appended after policy masks.
 - All fields are optional. Only set what you need - everything else falls back to CLI defaults.
 
+### Shared masking config
+
+Mask expressions live in separate file `data-masking-policy.yml`.
+
+The file is keyed by `database_id` and stores one canonical expression per column, with free-form tags. Policies select columns by tag.
+
+```yaml
+# data-masking-policy.yml
+version: 1
+
+databases:
+  myapp:
+    columns:
+      users.email:        { expr: "'user_' || id || '@test.com'", tags: [pii] }
+      users.first_name:   { expr: "'First' || id",                tags: [pii] }
+      billing.cards.number: { expr: "'4111111111111111'",         tags: [pii, financial] }
+    policies:
+      pii:       { include_tags: [pii] }
+      financial: { include_tags: [financial] }
+```
+
+Profile fields:
+
+```yaml
+database_id: myapp                       # selects the namespace in the shared file
+masks_file: ./data-masking-policy.yml    # optional explicit path
+extract:
+  mask_policies: [pii]                   # same as before
+```
+
+Both fields are optional. If `masks_file` is omitted, fixturize walks up from the profile's directory looking for `data-masking-policy.yml`, stopping at the `.git` boundary. If `database_id` is set but missing from the file, the loader errors and lists the available IDs.
+
+Inline `masks:` (from previous versions) can be used, but are now effectively deprecated.
+
 ## Precautions
 
 - extraction runs under **REPEATABLE READ** isolation - consistent snapshot, but holds a transaction open. Use `--statement-timeout` (default 30s) to bound query time.
