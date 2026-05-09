@@ -3,7 +3,9 @@ package fixturize
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -13,6 +15,8 @@ type (
 	Profile struct {
 		Connection string              `yaml:"connection"`
 		Schema     string              `yaml:"schema"`
+		DatabaseID string              `yaml:"database_id"`
+		MasksFile  string              `yaml:"masks_file"`
 		Masks      map[string][]string `yaml:"masks"`
 		Extract    ExtractProfile      `yaml:"extract"`
 		Apply      ApplyProfile        `yaml:"apply"`
@@ -57,11 +61,93 @@ func LoadProfile(path string) (*Profile, error) {
 		return nil, err
 	}
 
+	if err := mergeSharedMasks(&profile, path); err != nil {
+		return nil, err
+	}
+
 	if err := profile.Validate(); err != nil {
 		return nil, err
 	}
 
 	return &profile, nil
+}
+
+func mergeSharedMasks(p *Profile, profilePath string) error {
+	profileDir := filepath.Dir(profilePath)
+
+	masksPath, err := resolveMasksPath(p.MasksFile, profileDir)
+	if err != nil {
+		return err
+	}
+	if masksPath == "" {
+		return nil
+	}
+
+	shared, err := LoadSharedMasks(masksPath)
+	if err != nil {
+		return err
+	}
+
+	if p.DatabaseID == "" {
+		return nil
+	}
+
+	db, ok := shared.Databases[p.DatabaseID]
+	if !ok {
+		ids := make([]string, 0, len(shared.Databases))
+		for id := range shared.Databases {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		return fmt.Errorf("database_id %q not found in %s (available: %s)", p.DatabaseID, masksPath, strings.Join(ids, ", "))
+	}
+
+	if p.Masks == nil {
+		p.Masks = map[string][]string{}
+	}
+
+	for name, policy := range db.Policies {
+		if _, exists := p.Masks[name]; exists {
+			return fmt.Errorf("mask policy %q defined both inline and in %s", name, masksPath)
+		}
+		p.Masks[name] = expandPolicy(policy, db.Columns)
+	}
+
+	return nil
+}
+
+func resolveMasksPath(explicit, profileDir string) (string, error) {
+	if explicit != "" {
+		if filepath.IsAbs(explicit) {
+			return explicit, nil
+		}
+		return filepath.Join(profileDir, explicit), nil
+	}
+	return DiscoverMasksFile(profileDir)
+}
+
+func expandPolicy(policy SharedPolicy, columns map[string]SharedColumn) []string {
+	tagSet := make(map[string]struct{}, len(policy.IncludeTags))
+	for _, t := range policy.IncludeTags {
+		tagSet[t] = struct{}{}
+	}
+
+	keys := make([]string, 0, len(columns))
+	for key, col := range columns {
+		for _, t := range col.Tags {
+			if _, ok := tagSet[t]; ok {
+				keys = append(keys, key)
+				break
+			}
+		}
+	}
+	sort.Strings(keys)
+
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, fmt.Sprintf("%s=%s", key, columns[key].Expr))
+	}
+	return out
 }
 
 func expandConnectionEnvVars(p *Profile) error {

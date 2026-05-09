@@ -233,8 +233,12 @@ func FormatAnalysis(schema *DatabaseSchema, result *AnalyzeResult) string {
 }
 
 func FormatAnalysisYAML(schema *DatabaseSchema, result *AnalyzeResult) string {
+	var b strings.Builder
+	b.WriteString("version: 1\n\ndatabases:\n  default: # rename to match your dryrun database_id\n")
+
 	if len(result.Matches) == 0 {
-		return "masks:\n  pii: []\n"
+		b.WriteString("    columns: {}\n    policies:\n      pii: { include_tags: [pii] }\n")
+		return b.String()
 	}
 
 	var matchedTables []string
@@ -243,16 +247,15 @@ func FormatAnalysisYAML(schema *DatabaseSchema, result *AnalyzeResult) string {
 	}
 	sorted := schema.TopologicalSort(matchedTables, nil)
 
-	var b strings.Builder
-	b.WriteString("masks:\n  pii:\n")
-
+	b.WriteString("    columns:\n")
 	for _, tableName := range sorted {
-		matches := result.Matches[tableName]
-		for _, m := range matches {
-			entry := shortTableName(tableName) + "." + m.Column + "=" + m.MaskExpr
-			fmt.Fprintf(&b, "    - \"%s\"\n", strings.ReplaceAll(entry, `"`, `\"`))
+		for _, m := range result.Matches[tableName] {
+			key := shortTableName(tableName) + "." + m.Column
+			expr := strings.ReplaceAll(m.MaskExpr, `"`, `\"`)
+			fmt.Fprintf(&b, "      %s: { expr: \"%s\", tags: [pii] }\n", key, expr)
 		}
 	}
+	b.WriteString("    policies:\n      pii: { include_tags: [pii] }\n")
 
 	return b.String()
 }

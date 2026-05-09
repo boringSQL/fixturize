@@ -302,18 +302,23 @@ func TestFormatAnalysisYAML(t *testing.T) {
 	result := AnalyzeSchema(schema, []string{"public.users"}, ConfidenceLow)
 	output := FormatAnalysisYAML(schema, result)
 
-	if !strings.Contains(output, "masks:") {
-		t.Error("expected masks: key")
+	if !strings.Contains(output, "version: 1") {
+		t.Error("expected version: 1")
 	}
-	if !strings.Contains(output, "pii:") {
-		t.Error("expected pii: key")
+	if !strings.Contains(output, "databases:") {
+		t.Error("expected databases: key")
 	}
-	if !strings.Contains(output, "users.email=") {
-		t.Error("expected users.email= entry")
+	if !strings.Contains(output, "policies:") {
+		t.Error("expected policies: key")
 	}
-	// public. prefix should be stripped
+	if !strings.Contains(output, "users.email:") {
+		t.Error("expected users.email: entry")
+	}
+	if !strings.Contains(output, "tags: [pii]") {
+		t.Error("expected tags: [pii] on column entry")
+	}
 	if strings.Contains(output, "public.users") {
-		t.Error("public. prefix should be stripped")
+		t.Error("public. prefix should be stripped from column key")
 	}
 }
 
@@ -335,8 +340,11 @@ func TestFormatAnalysisYAML_NoMatches(t *testing.T) {
 	result := AnalyzeSchema(schema, []string{"public.settings"}, ConfidenceLow)
 	output := FormatAnalysisYAML(schema, result)
 
-	if !strings.Contains(output, "pii: []") {
-		t.Errorf("expected empty pii list, got: %s", output)
+	if !strings.Contains(output, "columns: {}") {
+		t.Errorf("expected empty columns map, got: %s", output)
+	}
+	if !strings.Contains(output, "pii: { include_tags: [pii] }") {
+		t.Errorf("expected pii policy stub, got: %s", output)
 	}
 }
 
@@ -358,8 +366,8 @@ func TestFormatAnalysisYAML_NonPublicSchema(t *testing.T) {
 	result := AnalyzeSchema(schema, []string{"auth.users"}, ConfidenceLow)
 	output := FormatAnalysisYAML(schema, result)
 
-	if !strings.Contains(output, "auth.users.email=") {
-		t.Errorf("expected auth.users.email= with schema prefix, got: %s", output)
+	if !strings.Contains(output, "auth.users.email:") {
+		t.Errorf("expected auth.users.email: with schema prefix, got: %s", output)
 	}
 }
 
@@ -383,23 +391,24 @@ func TestFormatAnalysisYAML_MultipleColumns(t *testing.T) {
 	result := AnalyzeSchema(schema, []string{"public.users"}, ConfidenceLow)
 	output := FormatAnalysisYAML(schema, result)
 
-	if !strings.Contains(output, "users.email=") {
-		t.Error("expected users.email= entry")
+	if !strings.Contains(output, "users.email:") {
+		t.Error("expected users.email: entry")
 	}
-	if !strings.Contains(output, "users.phone=") {
-		t.Error("expected users.phone= entry")
+	if !strings.Contains(output, "users.phone:") {
+		t.Error("expected users.phone: entry")
 	}
 
-	// Each entry should be a separate YAML list item
+	// Each column should be on its own line
 	lines := strings.Split(output, "\n")
-	listItems := 0
+	colEntries := 0
 	for _, line := range lines {
-		if strings.HasPrefix(strings.TrimSpace(line), "- ") {
-			listItems++
+		trimmed := strings.TrimSpace(line)
+		if strings.Contains(trimmed, "{ expr:") {
+			colEntries++
 		}
 	}
-	if listItems < 2 {
-		t.Errorf("expected at least 2 YAML list entries, got %d", listItems)
+	if colEntries < 2 {
+		t.Errorf("expected at least 2 column entries, got %d", colEntries)
 	}
 }
 
@@ -430,11 +439,11 @@ func TestFormatAnalysisYAML_MultipleTables(t *testing.T) {
 	result := AnalyzeSchema(schema, []string{"public.users", "public.contacts"}, ConfidenceLow)
 	output := FormatAnalysisYAML(schema, result)
 
-	if !strings.Contains(output, "users.email=") {
-		t.Error("expected users.email= entry")
+	if !strings.Contains(output, "users.email:") {
+		t.Error("expected users.email: entry")
 	}
-	if !strings.Contains(output, "contacts.phone=") {
-		t.Error("expected contacts.phone= entry")
+	if !strings.Contains(output, "contacts.phone:") {
+		t.Error("expected contacts.phone: entry")
 	}
 }
 
@@ -482,26 +491,27 @@ func TestFormatAnalysisYAML_ValidYAML(t *testing.T) {
 	result := AnalyzeSchema(schema, []string{"public.users"}, ConfidenceLow)
 	output := FormatAnalysisYAML(schema, result)
 
-	var parsed struct {
-		Masks map[string][]string `yaml:"masks"`
-	}
+	var parsed SharedMasksFile
 	if err := yaml.Unmarshal([]byte(output), &parsed); err != nil {
 		t.Fatalf("YAML output is not valid: %v\nOutput:\n%s", err, output)
 	}
 
-	pii := parsed.Masks["pii"]
-	if len(pii) == 0 {
-		t.Fatal("expected non-empty pii list after parsing")
+	if parsed.Version != 1 {
+		t.Errorf("expected version 1, got %d", parsed.Version)
 	}
 
-	foundEmail := false
-	for _, entry := range pii {
-		if strings.HasPrefix(entry, "users.email=") {
-			foundEmail = true
-		}
+	db, ok := parsed.Databases["default"]
+	if !ok {
+		t.Fatalf("expected default database namespace, got: %v", parsed.Databases)
 	}
-	if !foundEmail {
-		t.Errorf("expected users.email= in parsed YAML entries, got: %v", pii)
+
+	if _, ok := db.Columns["users.email"]; !ok {
+		t.Errorf("expected users.email column, got: %v", db.Columns)
+	}
+
+	pii, ok := db.Policies["pii"]
+	if !ok || len(pii.IncludeTags) == 0 || pii.IncludeTags[0] != "pii" {
+		t.Errorf("expected pii policy with include_tags [pii], got: %v", db.Policies)
 	}
 }
 
@@ -523,15 +533,14 @@ func TestFormatAnalysisYAML_ValidYAML_NoMatches(t *testing.T) {
 	result := AnalyzeSchema(schema, []string{"public.settings"}, ConfidenceLow)
 	output := FormatAnalysisYAML(schema, result)
 
-	var parsed struct {
-		Masks map[string][]string `yaml:"masks"`
-	}
+	var parsed SharedMasksFile
 	if err := yaml.Unmarshal([]byte(output), &parsed); err != nil {
 		t.Fatalf("empty YAML output is not valid: %v\nOutput:\n%s", err, output)
 	}
 
-	if len(parsed.Masks["pii"]) != 0 {
-		t.Errorf("expected empty pii list, got: %v", parsed.Masks["pii"])
+	db := parsed.Databases["default"]
+	if len(db.Columns) != 0 {
+		t.Errorf("expected empty columns, got: %v", db.Columns)
 	}
 }
 
