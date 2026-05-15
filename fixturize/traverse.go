@@ -33,7 +33,7 @@ func (e *Extractor) extractRootRows(table, clause string) error {
 		query += " " + clause
 	}
 
-	rows, err := e.tx.Query(query)
+	rows, err := e.tx.Query(e.ctx, query)
 	if err != nil {
 		return fmt.Errorf("root query failed: %w", err)
 	}
@@ -52,7 +52,7 @@ func (e *Extractor) extractRootRowsWithArgs(table, clause string, args ...any) e
 		query += " " + clause
 	}
 
-	rows, err := e.tx.Query(query, args...)
+	rows, err := e.tx.Query(e.ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("query failed: %w", err)
 	}
@@ -68,7 +68,7 @@ func (e *Extractor) extractAllRows(table string) error {
 	}
 	query := fmt.Sprintf("SELECT %s FROM %s", cols, QuoteQualifiedTable(table))
 
-	rows, err := e.tx.Query(query)
+	rows, err := e.tx.Query(e.ctx, query)
 	if err != nil {
 		return fmt.Errorf("query failed for %s: %w", table, err)
 	}
@@ -84,7 +84,7 @@ func (e *Extractor) queryAnyBatched(table, baseQuery, suffix string, values []an
 		if end > len(values) {
 			end = len(values)
 		}
-		rows, err := e.tx.Query(baseQuery+suffix, values[i:end])
+		rows, err := e.tx.Query(e.ctx, baseQuery+suffix, values[i:end])
 		if err != nil {
 			return err
 		}
@@ -110,7 +110,7 @@ func (e *Extractor) queryTupleBatched(table, selectClause, suffix string, cols [
 			end = len(tuples)
 		}
 		query, params := buildTupleQuery(selectClause, cols, tuples[i:end])
-		rows, err := e.tx.Query(query+suffix, params...)
+		rows, err := e.tx.Query(e.ctx, query+suffix, params...)
 		if err != nil {
 			return err
 		}

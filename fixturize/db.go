@@ -1,11 +1,11 @@
 package fixturize
 
 import (
-	"database/sql"
+	"context"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func OpenDB(pguri string) (*sql.DB, error) {
-	return sql.Open("pgx", pguri)
+func OpenDB(ctx context.Context, pguri string) (*pgxpool.Pool, error) {
+	return pgxpool.New(ctx, pguri)
 }

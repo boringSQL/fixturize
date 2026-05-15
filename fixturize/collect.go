@@ -1,11 +1,13 @@
 package fixturize
 
 import (
-	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 func (e *Extractor) loadGeneratedColumns() error {
@@ -17,7 +19,7 @@ func (e *Extractor) loadGeneratedColumns() error {
 		  AND table_schema NOT IN ('pg_catalog', 'information_schema')
 	`
 
-	rows, err := e.tx.Query(query)
+	rows, err := e.tx.Query(e.ctx, query)
 	if err != nil {
 		return err
 	}
@@ -51,16 +53,8 @@ func (e *Extractor) loadGeneratedColumns() error {
 	return rows.Err()
 }
 
-func (e *Extractor) collectRows(tableName string, rows *sql.Rows) error {
-	columns, err := rows.Columns()
-	if err != nil {
-		return err
-	}
-
-	colTypes, err := rows.ColumnTypes()
-	if err != nil {
-		return err
-	}
+func (e *Extractor) collectRows(tableName string, rows pgx.Rows) error {
+	fds := rows.FieldDescriptions()
 
 	tableInfo, _ := e.schema.GetTable(tableName)
 	var pkCols []string
@@ -75,23 +69,18 @@ func (e *Extractor) collectRows(tableName string, rows *sql.Rows) error {
 	}
 
 	for rows.Next() {
-		dest := make([]any, len(columns))
-		for i := range dest {
-			dest[i] = new(any)
-		}
-
-		if err := rows.Scan(dest...); err != nil {
+		vals, err := rows.Values()
+		if err != nil {
 			return fmt.Errorf("scan failed for %s: %w", tableName, err)
 		}
 
-		row := make(map[string]any, len(columns))
-		for i, col := range columns {
+		row := make(map[string]any, len(fds))
+		for i, fd := range fds {
+			col := fd.Name
 			if genCols[col] {
 				continue
 			}
-
-			rawVal := *(dest[i].(*any))
-			row[col] = convertValue(rawVal, colTypes[i])
+			row[col] = convertValue(vals[i], fd.DataTypeOID)
 		}
 
 		if len(pkCols) > 0 {
@@ -108,35 +97,44 @@ func (e *Extractor) collectRows(tableName string, rows *sql.Rows) error {
 	return rows.Err()
 }
 
-func convertValue(val any, colType *sql.ColumnType) any {
+func convertValue(val any, oid uint32) any {
 	if val == nil {
 		return nil
 	}
 
-	switch v := val.(type) {
-	case time.Time:
-		typeName := strings.ToLower(colType.DatabaseTypeName())
-		if typeName == "DATE" || typeName == "date" {
-			return v.Format("2006-01-02")
+	switch oid {
+	case pgtype.DateOID:
+		if t, ok := val.(time.Time); ok {
+			return t.Format("2006-01-02")
 		}
-		return v.Format(time.RFC3339)
-
-	case []byte:
-		typeName := strings.ToUpper(colType.DatabaseTypeName())
-		if typeName == "JSON" || typeName == "JSONB" {
-			return string(v)
+	case pgtype.TimestampOID, pgtype.TimestamptzOID:
+		if t, ok := val.(time.Time); ok {
+			return t.Format(time.RFC3339)
 		}
-		if typeName == "UUID" || len(v) == 16 {
+	case pgtype.JSONOID, pgtype.JSONBOID:
+		if b, ok := val.([]byte); ok {
+			return string(b)
+		}
+	case pgtype.UUIDOID:
+		switch v := val.(type) {
+		case [16]byte:
+			return formatUUID(v[:])
+		case []byte:
 			return formatUUID(v)
 		}
-		return `\x` + hex.EncodeToString(v)
+	case pgtype.ByteaOID:
+		if b, ok := val.([]byte); ok {
+			return `\x` + hex.EncodeToString(b)
+		}
+	}
 
+	switch v := val.(type) {
+	case time.Time:
+		return v.Format(time.RFC3339)
 	case [16]byte:
 		return formatUUID(v[:])
-
 	case int64, int32, int16, int8, float64, float32, bool, string:
 		return v
-
 	default:
 		return fmt.Sprintf("%v", v)
 	}

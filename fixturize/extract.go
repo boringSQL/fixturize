@@ -1,10 +1,13 @@
 package fixturize
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type (
@@ -38,8 +41,9 @@ type (
 	}
 
 	Extractor struct {
-		db              *sql.DB
-		tx              *sql.Tx
+		ctx             context.Context
+		db              *pgxpool.Pool
+		tx              pgx.Tx
 		schema          *DatabaseSchema
 		options         *ExtractOptions
 		invertedGraph   map[string][]fkEdge
@@ -68,13 +72,14 @@ type (
 
 const maxTraversalIterations = 100
 
-func NewExtractor(db *sql.DB, options *ExtractOptions) *Extractor {
+func NewExtractor(ctx context.Context, db *pgxpool.Pool, options *ExtractOptions) *Extractor {
 	excludeSet := make(map[string]bool)
 	for _, t := range options.Exclude {
 		excludeSet[t] = true
 	}
 
 	return &Extractor{
+		ctx:             ctx,
 		db:              db,
 		options:         options,
 		invertedGraph:   make(map[string][]fkEdge),
@@ -95,7 +100,7 @@ func NewExtractor(db *sql.DB, options *ExtractOptions) *Extractor {
 
 func (e *Extractor) Extract() (*ExtractResult, error) {
 	fmt.Print("Introspecting schema... ")
-	schema, err := IntrospectSchema(e.db)
+	schema, err := IntrospectSchema(e.ctx, e.db)
 	if err != nil {
 		return nil, fmt.Errorf("failed to introspect schema: %w", err)
 	}
@@ -109,22 +114,18 @@ func (e *Extractor) Extract() (*ExtractResult, error) {
 		return nil, err
 	}
 
-	tx, err := e.db.Begin()
+	tx, err := e.db.BeginTx(e.ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	e.tx = tx
-	defer tx.Rollback()
-
-	if _, err := tx.Exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
-		return nil, fmt.Errorf("failed to set isolation level: %w", err)
-	}
+	defer tx.Rollback(e.ctx)
 
 	timeout := e.options.StatementTimeout
 	if timeout <= 0 {
 		timeout = 30
 	}
-	if _, err := tx.Exec(fmt.Sprintf("SET statement_timeout = '%ds'", timeout)); err != nil {
+	if _, err := tx.Exec(e.ctx, fmt.Sprintf("SET statement_timeout = '%ds'", timeout)); err != nil {
 		return nil, fmt.Errorf("failed to set statement_timeout: %w", err)
 	}
 
@@ -155,7 +156,7 @@ func (e *Extractor) Extract() (*ExtractResult, error) {
 		fmt.Printf("Root query: %s\n", rootQuery)
 
 		fmt.Print("Validating query... ")
-		if _, err := e.tx.Exec("EXPLAIN " + rootQuery); err != nil {
+		if _, err := e.tx.Exec(e.ctx, "EXPLAIN "+rootQuery); err != nil {
 			fmt.Println("FAILED")
 			return nil, fmt.Errorf("invalid root query:\n  %s\n  %w", rootQuery, err)
 		}
@@ -431,7 +432,7 @@ func (e *Extractor) getOrderedColumns(tableName string) ([]string, error) {
 		ORDER BY ordinal_position
 	`
 
-	rows, err := e.tx.Query(query, schemaName, table)
+	rows, err := e.tx.Query(e.ctx, query, schemaName, table)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get columns for %s: %w", tableName, err)
 	}
