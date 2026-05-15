@@ -126,6 +126,14 @@ func convertValue(val any, oid uint32) any {
 		if b, ok := val.([]byte); ok {
 			return `\x` + hex.EncodeToString(b)
 		}
+	case pgtype.NumericOID:
+		// pgx returns pgtype.Numeric (struct) here; %v would print struct fields.
+		// Value() yields the canonical decimal string with full precision.
+		if n, ok := val.(pgtype.Numeric); ok {
+			if v, err := n.Value(); err == nil && v != nil {
+				return v
+			}
+		}
 	}
 
 	switch v := val.(type) {
