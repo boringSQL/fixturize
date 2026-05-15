@@ -2,21 +2,35 @@
 
 package fixturize
 
+// Integration tests for the extract → apply round-trip. They run against a
+// real PostgreSQL instance spun up via testcontainers — no mocks, because the
+// whole point of these tests is to catch wire-level surprises (FK ordering,
+// partition introspection, COPY semantics, sequence sync, etc.).
+//
+// As of the pgx native migration this file uses a *pgxpool.Pool directly
+// instead of *sql.DB + the pgx stdlib driver. Every pgxpool method takes an
+// explicit context.Context as its first argument — there is no implicit
+// background context like database/sql had — so each test helper threads
+// t.Context() through to the pool, which gives us automatic cancellation
+// when the test ends or fails.
+
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
-
-	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-var testDB *sql.DB
+// testDB is the package-wide pgxpool.Pool used by every test in this file.
+// It is opened once in TestMain against the containerised Postgres and torn
+// down on exit. Tests share a single pool because the schema is created once
+// and each test resets data via resetDB().
+var testDB *pgxpool.Pool
 
 const schemaDDL = `
 CREATE TABLE organizations (
@@ -145,6 +159,11 @@ CREATE TABLE item_notes (
 );
 `
 
+// TestMain bootstraps the test environment: it starts a Postgres container,
+// opens a pgxpool against it, applies schemaDDL, runs all tests, and tears
+// everything down on exit. Because TestMain is not a *testing.T it cannot use
+// t.Context(); a plain context.Background() is used for container + pool
+// lifecycle, which is fine because it lives exactly as long as the process.
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
@@ -156,6 +175,9 @@ func TestMain(m *testing.M) {
 			"POSTGRES_PASSWORD": "test",
 			"POSTGRES_DB":       "testdb",
 		},
+		// Postgres logs "ready to accept connections" twice during startup
+		// (once during init, once after); waiting for the second occurrence
+		// avoids racing the init phase.
 		WaitingFor: wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
 	}
 
@@ -173,13 +195,17 @@ func TestMain(m *testing.M) {
 
 	dsn := fmt.Sprintf("postgres://test:test@%s:%s/testdb?sslmode=disable", host, port.Port())
 
-	testDB, err = sql.Open("pgx", dsn)
+	// pgxpool.New replaces sql.Open("pgx", dsn). It returns a *pgxpool.Pool
+	// directly — no driver registration, no stdlib indirection. The pool
+	// lazily opens connections on first use, so any DSN problems will surface
+	// on the first Exec below, not here.
+	testDB, err = pgxpool.New(ctx, dsn)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open db: %v\n", err)
 		os.Exit(1)
 	}
 
-	if _, err := testDB.Exec(schemaDDL); err != nil {
+	if _, err := testDB.Exec(ctx, schemaDDL); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create schema: %v\n", err)
 		os.Exit(1)
 	}
@@ -193,6 +219,9 @@ func TestMain(m *testing.M) {
 
 // --- helpers ---
 
+// allTables is the truncation order — order itself doesn't matter because we
+// use TRUNCATE ... CASCADE, but the list must include every table created by
+// schemaDDL or resetDB() will leave stale rows behind and confuse later tests.
 var allTables = []string{
 	"audit_logs", "categories", "departments", "employees",
 	"events", "item_notes", "items", "metrics",
@@ -201,17 +230,26 @@ var allTables = []string{
 	"workspace_projects",
 }
 
-func resetDB(t *testing.T, db *sql.DB) {
+// resetDB empties every test table and resets identity sequences so each test
+// starts from a known-clean state. We thread t.Context() so a failed/cancelled
+// test doesn't leave dangling Postgres operations behind.
+func resetDB(t *testing.T, db *pgxpool.Pool) {
 	t.Helper()
+	ctx := t.Context()
 	for _, table := range allTables {
-		if _, err := db.Exec(fmt.Sprintf("TRUNCATE TABLE %s RESTART IDENTITY CASCADE", table)); err != nil {
+		if _, err := db.Exec(ctx, fmt.Sprintf("TRUNCATE TABLE %s RESTART IDENTITY CASCADE", table)); err != nil {
 			t.Fatalf("truncate %s: %v", table, err)
 		}
 	}
 }
 
-func seedAll(t *testing.T, db *sql.DB) {
+// seedAll populates every table with a known-good baseline so individual tests
+// can assert against deterministic IDs (org 1 = Acme, user 1 = Alice, …).
+// Tests that need a narrower seed (just categories, just circular FKs) call a
+// scoped helper instead.
+func seedAll(t *testing.T, db *pgxpool.Pool) {
 	t.Helper()
+	ctx := t.Context()
 	queries := []string{
 		`INSERT INTO organizations (id, name, secret_code) VALUES (1, 'Acme Corp', 'TOP_SECRET_123'), (2, 'Beta Inc', 'CLASSIFIED_456')`,
 		`SELECT setval('organizations_id_seq', 2)`,
@@ -241,27 +279,35 @@ func seedAll(t *testing.T, db *sql.DB) {
 		`SELECT setval('item_notes_id_seq', 3)`,
 	}
 	for _, q := range queries {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(ctx, q); err != nil {
 			t.Fatalf("seed query failed: %s\n  %v", q, err)
 		}
 	}
 }
 
-func seedCategories(t *testing.T, db *sql.DB) {
+// seedCategories sets up just the categories tree (Root → Child → Grandchild)
+// for tests that exercise self-referencing FK traversal without the noise of
+// the full seed.
+func seedCategories(t *testing.T, db *pgxpool.Pool) {
 	t.Helper()
+	ctx := t.Context()
 	queries := []string{
 		`INSERT INTO categories (id, parent_id, name) VALUES (1, NULL, 'Root'), (2, 1, 'Child'), (3, 2, 'Grandchild')`,
 		`SELECT setval('categories_id_seq', 3)`,
 	}
 	for _, q := range queries {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(ctx, q); err != nil {
 			t.Fatalf("seed categories failed: %s\n  %v", q, err)
 		}
 	}
 }
 
-func seedCircular(t *testing.T, db *sql.DB) {
+// seedCircular sets up the departments ↔ employees mutual FK so we can test
+// extraction + apply against a true cycle. Constraints are DEFERRABLE so the
+// initial INSERT + UPDATE here works without a single-transaction dance.
+func seedCircular(t *testing.T, db *pgxpool.Pool) {
 	t.Helper()
+	ctx := t.Context()
 	queries := []string{
 		`INSERT INTO departments (id, name, lead_employee_id) VALUES (1, 'Engineering', NULL)`,
 		`INSERT INTO employees (id, department_id, name) VALUES (1, 1, 'Jane Lead')`,
@@ -270,18 +316,24 @@ func seedCircular(t *testing.T, db *sql.DB) {
 		`SELECT setval('employees_id_seq', 1)`,
 	}
 	for _, q := range queries {
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(ctx, q); err != nil {
 			t.Fatalf("seed circular failed: %s\n  %v", q, err)
 		}
 	}
 }
 
-func extractFixture(t *testing.T, db *sql.DB, opts *ExtractOptions) *ExtractResult {
+// extractFixture runs the production Extractor against the live test DB and
+// returns the resulting ExtractResult. Any extract error fails the test
+// immediately — the alternative (returning an error) would force every caller
+// to write the same three-line check.
+func extractFixture(t *testing.T, db *pgxpool.Pool, opts *ExtractOptions) *ExtractResult {
 	t.Helper()
 	if opts.Schema == "" {
 		opts.Schema = "public"
 	}
-	e := NewExtractor(db, opts)
+	// NewExtractor now takes ctx as its first argument; we use t.Context() so
+	// a cancelled/failed test stops the underlying transaction promptly.
+	e := NewExtractor(t.Context(), db, opts)
 	result, err := e.Extract()
 	if err != nil {
 		t.Fatalf("extract failed: %v", err)
@@ -289,25 +341,35 @@ func extractFixture(t *testing.T, db *sql.DB, opts *ExtractOptions) *ExtractResu
 	return result
 }
 
-func applyFixture(t *testing.T, db *sql.DB, fixture *Fixture, opts *ApplyOptions) *ApplyResult {
+// applyFixture is the symmetric helper to extractFixture: it loads a Fixture
+// back into the DB via the production Applier and returns the result. As with
+// extractFixture, errors fail the test directly to keep call sites terse.
+func applyFixture(t *testing.T, db *pgxpool.Pool, fixture *Fixture, opts *ApplyOptions) *ApplyResult {
 	t.Helper()
 	a := NewApplier(db, opts)
-	result, err := a.Apply(context.Background(), fixture)
+	result, err := a.Apply(t.Context(), fixture)
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
 	return result
 }
 
-func rowCount(t *testing.T, db *sql.DB, table string) int {
+// rowCount returns the row count for an unqualified table name. Used by
+// round-trip tests to assert that what came out of the fixture went back in.
+func rowCount(t *testing.T, db *pgxpool.Pool, table string) int {
 	t.Helper()
 	var count int
-	if err := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&count); err != nil {
+	// pgxpool.Pool.QueryRow takes ctx; .Scan() on the resulting Row preserves
+	// the database/sql idiom of "errors deferred until Scan".
+	if err := db.QueryRow(t.Context(), fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&count); err != nil {
 		t.Fatalf("count %s: %v", table, err)
 	}
 	return count
 }
 
+// colIndex returns the index of `name` in ft.Columns, or -1 if absent. Tests
+// use this because FixtureTable stores rows as []any aligned to the Columns
+// slice rather than as map[string]any.
 func colIndex(ft *FixtureTable, name string) int {
 	for i, c := range ft.Columns {
 		if c == name {
@@ -320,7 +382,10 @@ func colIndex(ft *FixtureTable, name string) int {
 // --- tests ---
 
 func TestTopologicalSort(t *testing.T) {
-	schema, err := IntrospectSchema(testDB)
+	// IntrospectSchema now takes ctx as its first argument (pgx native API).
+	// We pass t.Context() so the introspection queries are cancelled if the
+	// test fails/times out.
+	schema, err := IntrospectSchema(t.Context(), testDB)
 	if err != nil {
 		t.Fatalf("introspect: %v", err)
 	}
@@ -349,7 +414,7 @@ func TestTopologicalSort(t *testing.T) {
 }
 
 func TestTopologicalSortCircular(t *testing.T) {
-	schema, err := IntrospectSchema(testDB)
+	schema, err := IntrospectSchema(t.Context(), testDB)
 	if err != nil {
 		t.Fatalf("introspect: %v", err)
 	}
@@ -492,7 +557,7 @@ func TestIdentityColumns(t *testing.T) {
 
 	// get the source audit_logs id for comparison
 	var sourceID int
-	if err := testDB.QueryRow("SELECT id FROM audit_logs LIMIT 1").Scan(&sourceID); err != nil {
+	if err := testDB.QueryRow(t.Context(), "SELECT id FROM audit_logs LIMIT 1").Scan(&sourceID); err != nil {
 		t.Fatalf("query source audit_logs id: %v", err)
 	}
 
@@ -532,7 +597,7 @@ func TestIdentityColumns(t *testing.T) {
 		action    string
 	)
 
-	err := testDB.QueryRow("SELECT id, org_id, action FROM audit_logs").Scan(&appliedID, &orgID, &action)
+	err := testDB.QueryRow(t.Context(), "SELECT id, org_id, action FROM audit_logs").Scan(&appliedID, &orgID, &action)
 	if err != nil {
 		t.Fatalf("query applied audit_logs: %v", err)
 	}
@@ -590,9 +655,11 @@ func TestSelfReferencingFK(t *testing.T) {
 		t.Fatalf("expected 3 categories after apply, got %d", c)
 	}
 
-	// Verify parent_id relationships
+	// Verify parent_id relationships. Note: pgx returns NULL columns as a
+	// typed zero (*int → nil) when scanned into a pointer — same observable
+	// behaviour as database/sql, just routed through a different code path.
 	var parentID *int
-	err := testDB.QueryRow("SELECT parent_id FROM categories WHERE name = 'Root'").Scan(&parentID)
+	err := testDB.QueryRow(t.Context(), "SELECT parent_id FROM categories WHERE name = 'Root'").Scan(&parentID)
 	if err != nil {
 		t.Fatalf("query Root category: %v", err)
 	}
@@ -601,13 +668,13 @@ func TestSelfReferencingFK(t *testing.T) {
 	}
 
 	var childParent int
-	err = testDB.QueryRow("SELECT parent_id FROM categories WHERE name = 'Child'").Scan(&childParent)
+	err = testDB.QueryRow(t.Context(), "SELECT parent_id FROM categories WHERE name = 'Child'").Scan(&childParent)
 	if err != nil {
 		t.Fatalf("query Child category: %v", err)
 	}
 
 	var rootID int
-	if err := testDB.QueryRow("SELECT id FROM categories WHERE name = 'Root'").Scan(&rootID); err != nil {
+	if err := testDB.QueryRow(t.Context(), "SELECT id FROM categories WHERE name = 'Root'").Scan(&rootID); err != nil {
 		t.Fatalf("query Root id: %v", err)
 	}
 	if childParent != rootID {
@@ -673,11 +740,11 @@ func TestCircularFKRoundTrip(t *testing.T) {
 
 	// Verify circular references survived the round-trip
 	var appliedLead, appliedDept int
-	err := testDB.QueryRow("SELECT lead_employee_id FROM departments WHERE id = 1").Scan(&appliedLead)
+	err := testDB.QueryRow(t.Context(), "SELECT lead_employee_id FROM departments WHERE id = 1").Scan(&appliedLead)
 	if err != nil {
 		t.Fatalf("query applied department lead: %v", err)
 	}
-	err = testDB.QueryRow("SELECT department_id FROM employees WHERE id = 1").Scan(&appliedDept)
+	err = testDB.QueryRow(t.Context(), "SELECT department_id FROM employees WHERE id = 1").Scan(&appliedDept)
 	if err != nil {
 		t.Fatalf("query applied employee dept: %v", err)
 	}
@@ -741,7 +808,7 @@ func TestFullRoundTrip(t *testing.T) {
 
 	// Verify FK integrity — all user.org_id values exist in organizations
 	var badFKCount int
-	err = testDB.QueryRow(`
+	err = testDB.QueryRow(t.Context(), `
 		SELECT COUNT(*) FROM users u
 		LEFT JOIN organizations o ON o.id = u.org_id
 		WHERE o.id IS NULL
@@ -755,7 +822,7 @@ func TestFullRoundTrip(t *testing.T) {
 
 	// Verify specific data values survived the round-trip
 	var orgName string
-	if err := testDB.QueryRow("SELECT name FROM organizations WHERE id = 1").Scan(&orgName); err != nil {
+	if err := testDB.QueryRow(t.Context(), "SELECT name FROM organizations WHERE id = 1").Scan(&orgName); err != nil {
 		t.Fatalf("query org name: %v", err)
 	}
 	if orgName != "Acme Corp" {
@@ -763,7 +830,7 @@ func TestFullRoundTrip(t *testing.T) {
 	}
 
 	var userEmail string
-	if err := testDB.QueryRow("SELECT email FROM users WHERE id = 1").Scan(&userEmail); err != nil {
+	if err := testDB.QueryRow(t.Context(), "SELECT email FROM users WHERE id = 1").Scan(&userEmail); err != nil {
 		t.Fatalf("query user email: %v", err)
 	}
 	if userEmail != "alice@acme.com" {
@@ -777,7 +844,7 @@ func TestFullRoundTrip(t *testing.T) {
 
 	// Verify sequences were synced — next insert should not conflict
 	var newID int
-	err = testDB.QueryRow("INSERT INTO users (org_id, email) VALUES (1, 'new@acme.com') RETURNING id").Scan(&newID)
+	err = testDB.QueryRow(t.Context(), "INSERT INTO users (org_id, email) VALUES (1, 'new@acme.com') RETURNING id").Scan(&newID)
 	if err != nil {
 		t.Fatalf("insert after sequence sync failed: %v", err)
 	}
@@ -790,7 +857,7 @@ func TestPartitionedTable(t *testing.T) {
 	resetDB(t, testDB)
 	seedAll(t, testDB)
 
-	schema, err := IntrospectSchema(testDB)
+	schema, err := IntrospectSchema(t.Context(), testDB)
 	if err != nil {
 		t.Fatalf("introspect: %v", err)
 	}
@@ -900,7 +967,7 @@ func TestPartitionedTable(t *testing.T) {
 
 	// Verify FK from task_comments -> tasks survived round-trip
 	var badFK int
-	err = testDB.QueryRow(`
+	err = testDB.QueryRow(t.Context(), `
 		SELECT COUNT(*) FROM task_comments tc
 		LEFT JOIN tasks t ON t.id = tc.task_id
 		WHERE t.id IS NULL
@@ -917,7 +984,7 @@ func TestNestedPartitions(t *testing.T) {
 	resetDB(t, testDB)
 	seedAll(t, testDB)
 
-	schema, err := IntrospectSchema(testDB)
+	schema, err := IntrospectSchema(t.Context(), testDB)
 	if err != nil {
 		t.Fatalf("introspect: %v", err)
 	}
@@ -935,8 +1002,10 @@ func TestNestedPartitions(t *testing.T) {
 		}
 	}
 
-	// Verify partition map resolves nested partitions to root
-	partMap, err := getPartitionParents(testDB)
+	// Verify partition map resolves nested partitions to root.
+	// getPartitionParents is a package-internal helper; like its sibling
+	// IntrospectSchema, it now takes ctx as the first argument.
+	partMap, err := getPartitionParents(t.Context(), testDB)
 	if err != nil {
 		t.Fatalf("getPartitionParents: %v", err)
 	}
@@ -987,7 +1056,7 @@ func TestNestedPartitions(t *testing.T) {
 }
 
 func TestAnalyzeSchemaIntegration(t *testing.T) {
-	schema, err := IntrospectSchema(testDB)
+	schema, err := IntrospectSchema(t.Context(), testDB)
 	if err != nil {
 		t.Fatalf("introspect: %v", err)
 	}
@@ -1080,12 +1149,12 @@ func TestCompositeForeignKey(t *testing.T) {
 		`SELECT setval('project_assignments_id_seq', 2)`,
 	}
 	for _, q := range queries {
-		if _, err := testDB.Exec(q); err != nil {
+		if _, err := testDB.Exec(t.Context(), q); err != nil {
 			t.Fatalf("seed: %s\n  %v", q, err)
 		}
 	}
 
-	schema, err := IntrospectSchema(testDB)
+	schema, err := IntrospectSchema(t.Context(), testDB)
 	if err != nil {
 		t.Fatalf("introspect: %v", err)
 	}
