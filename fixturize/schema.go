@@ -227,7 +227,7 @@ func getColumns(ctx context.Context, db *pgxpool.Pool, schemaName, tableName str
 			NOT a.attnotnull,
 			pg_get_expr(d.adbin, d.adrelid),
 			a.attnum,
-			a.attgenerated
+			a.attgenerated::text
 		FROM pg_attribute a
 		LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
 		WHERE a.attrelid = ($1 || '.' || $2)::regclass
