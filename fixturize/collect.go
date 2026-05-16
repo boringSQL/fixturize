@@ -2,6 +2,7 @@ package fixturize
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -112,8 +113,18 @@ func convertValue(val any, oid uint32) any {
 			return t.Format(time.RFC3339)
 		}
 	case pgtype.JSONOID, pgtype.JSONBOID:
-		if b, ok := val.([]byte); ok {
-			return string(b)
+		// pgx decodes JSON/JSONB into Go values (map/slice/etc.) by default,
+		// not raw bytes — so we have to re-marshal to get a valid JSON string.
+		// String/[]byte branches cover odd codec registrations.
+		switch v := val.(type) {
+		case []byte:
+			return string(v)
+		case string:
+			return v
+		default:
+			if b, err := json.Marshal(v); err == nil {
+				return string(b)
+			}
 		}
 	case pgtype.UUIDOID:
 		switch v := val.(type) {
