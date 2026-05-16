@@ -40,13 +40,13 @@ func runSuggestRoots(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	db, err := fixturize.OpenDB(conn)
+	db, err := fixturize.OpenDB(cmd.Context(), conn)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 	defer db.Close()
 
-	dbSchema, err := fixturize.IntrospectSchema(db)
+	dbSchema, err := fixturize.IntrospectSchema(cmd.Context(), db)
 	if err != nil {
 		return fmt.Errorf("failed to introspect schema: %w", err)
 	}

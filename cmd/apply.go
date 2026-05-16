@@ -51,7 +51,7 @@ func runApply(cmd *cobra.Command, args []string) error {
 	}
 	force, disableTriggers, syncSequences := mergeApplyFlags(cmd)
 
-	db, err := fixturize.OpenDB(conn)
+	db, err := fixturize.OpenDB(cmd.Context(), conn)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -66,7 +66,7 @@ func runApply(cmd *cobra.Command, args []string) error {
 		SyncSequences:   syncSequences,
 	}
 
-	result, err := fixturize.ApplyFixtureFile(db, options)
+	result, err := fixturize.ApplyFixtureFile(cmd.Context(), db, options)
 	if err != nil {
 		return err
 	}

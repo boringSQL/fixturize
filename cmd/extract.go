@@ -113,7 +113,7 @@ func runExtract(cmd *cobra.Command, args []string) error {
 	}
 
 	conn = expandEnvVars(conn)
-	db, err := fixturize.OpenDB(conn)
+	db, err := fixturize.OpenDB(cmd.Context(), conn)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -141,7 +141,7 @@ func runExtract(cmd *cobra.Command, args []string) error {
 		os.Remove(output)
 	}
 
-	extractor := fixturize.NewExtractor(db, options)
+	extractor := fixturize.NewExtractor(cmd.Context(), db, options)
 	result, err := extractor.Extract()
 	if err != nil {
 		return fmt.Errorf("extraction failed: %w", err)

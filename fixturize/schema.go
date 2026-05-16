@@ -1,9 +1,11 @@
 package fixturize
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 	"strings"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type (
@@ -40,17 +42,17 @@ type (
 	}
 )
 
-func IntrospectSchema(db *sql.DB) (*DatabaseSchema, error) {
+func IntrospectSchema(ctx context.Context, db *pgxpool.Pool) (*DatabaseSchema, error) {
 	dbSchema := &DatabaseSchema{
 		tables: make(map[string]*TableInfo),
 	}
 
-	tables, err := getTables(db)
+	tables, err := getTables(ctx, db)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tables: %w", err)
 	}
 
-	partitionMap, err := getPartitionParents(db)
+	partitionMap, err := getPartitionParents(ctx, db)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get partition map: %w", err)
 	}
@@ -64,13 +66,13 @@ func IntrospectSchema(db *sql.DB) (*DatabaseSchema, error) {
 			Columns: make(map[string]*ColumnInfo),
 		}
 
-		columns, err := getColumns(db, schemaName, tableName)
+		columns, err := getColumns(ctx, db, schemaName, tableName)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get columns for table '%s': %w", qualifiedName, err)
 		}
 		tableInfo.Columns = columns
 
-		primaryKeys, err := getPrimaryKeys(db, schemaName, tableName)
+		primaryKeys, err := getPrimaryKeys(ctx, db, schemaName, tableName)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get primary keys for table '%s': %w", qualifiedName, err)
 		}
@@ -82,7 +84,7 @@ func IntrospectSchema(db *sql.DB) (*DatabaseSchema, error) {
 			}
 		}
 
-		foreignKeys, err := getForeignKeys(db, schemaName, tableName)
+		foreignKeys, err := getForeignKeys(ctx, db, schemaName, tableName)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get foreign keys for table '%s': %w", qualifiedName, err)
 		}
@@ -103,7 +105,7 @@ func IntrospectSchema(db *sql.DB) (*DatabaseSchema, error) {
 			}
 		}
 
-		uniqueCols, err := getUniqueColumns(db, schemaName, tableName)
+		uniqueCols, err := getUniqueColumns(ctx, db, schemaName, tableName)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get unique constraints for table '%s': %w", qualifiedName, err)
 		}
@@ -119,7 +121,7 @@ func IntrospectSchema(db *sql.DB) (*DatabaseSchema, error) {
 	return dbSchema, nil
 }
 
-func getTables(db *sql.DB) ([]string, error) {
+func getTables(ctx context.Context, db *pgxpool.Pool) ([]string, error) {
 	query := `
 		SELECT table_schema, table_name
 		FROM information_schema.tables t
@@ -134,7 +136,7 @@ func getTables(db *sql.DB) ([]string, error) {
 		ORDER BY table_schema, table_name
 	`
 
-	rows, err := db.Query(query)
+	rows, err := db.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +154,7 @@ func getTables(db *sql.DB) ([]string, error) {
 	return tables, rows.Err()
 }
 
-func getPartitionParents(db *sql.DB) (map[string]string, error) {
+func getPartitionParents(ctx context.Context, db *pgxpool.Pool) (map[string]string, error) {
 	query := `
 		WITH RECURSIVE partition_tree AS (
 			-- base: direct children of root partitioned tables
@@ -191,7 +193,7 @@ func getPartitionParents(db *sql.DB) (map[string]string, error) {
 		JOIN pg_namespace rns ON rc.relnamespace = rns.oid
 	`
 
-	rows, err := db.Query(query)
+	rows, err := db.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +219,7 @@ func parseTableName(name string) (schema, table string) {
 	return "public", name
 }
 
-func getColumns(db *sql.DB, schemaName, tableName string) (map[string]*ColumnInfo, error) {
+func getColumns(ctx context.Context, db *pgxpool.Pool, schemaName, tableName string) (map[string]*ColumnInfo, error) {
 	query := `
 		SELECT
 			a.attname,
@@ -225,7 +227,7 @@ func getColumns(db *sql.DB, schemaName, tableName string) (map[string]*ColumnInf
 			NOT a.attnotnull,
 			pg_get_expr(d.adbin, d.adrelid),
 			a.attnum,
-			a.attgenerated
+			a.attgenerated::text
 		FROM pg_attribute a
 		LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
 		WHERE a.attrelid = ($1 || '.' || $2)::regclass
@@ -234,7 +236,7 @@ func getColumns(db *sql.DB, schemaName, tableName string) (map[string]*ColumnInf
 		ORDER BY a.attnum
 	`
 
-	rows, err := db.Query(query, schemaName, tableName)
+	rows, err := db.Query(ctx, query, schemaName, tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +272,7 @@ func getColumns(db *sql.DB, schemaName, tableName string) (map[string]*ColumnInf
 	return columns, rows.Err()
 }
 
-func getPrimaryKeys(db *sql.DB, schemaName, tableName string) ([]string, error) {
+func getPrimaryKeys(ctx context.Context, db *pgxpool.Pool, schemaName, tableName string) ([]string, error) {
 	qualifiedName := schemaName + "." + tableName
 	query := `
 		SELECT a.attname
@@ -281,7 +283,7 @@ func getPrimaryKeys(db *sql.DB, schemaName, tableName string) ([]string, error) 
 		ORDER BY array_position(i.indkey, a.attnum)
 	`
 
-	rows, err := db.Query(query, qualifiedName)
+	rows, err := db.Query(ctx, query, qualifiedName)
 	if err != nil {
 		return nil, err
 	}
@@ -299,7 +301,7 @@ func getPrimaryKeys(db *sql.DB, schemaName, tableName string) ([]string, error) 
 	return primaryKeys, rows.Err()
 }
 
-func getForeignKeys(db *sql.DB, schemaName, tableName string) ([]*ForeignKeyInfo, error) {
+func getForeignKeys(ctx context.Context, db *pgxpool.Pool, schemaName, tableName string) ([]*ForeignKeyInfo, error) {
 	query := `
 		SELECT
 			c.conname,
@@ -330,7 +332,7 @@ func getForeignKeys(db *sql.DB, schemaName, tableName string) ([]*ForeignKeyInfo
 		ORDER BY c.conname, cols.ord
 	`
 
-	rows, err := db.Query(query, schemaName, tableName)
+	rows, err := db.Query(ctx, query, schemaName, tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +352,7 @@ func getForeignKeys(db *sql.DB, schemaName, tableName string) ([]*ForeignKeyInfo
 	return foreignKeys, rows.Err()
 }
 
-func getUniqueColumns(db *sql.DB, schemaName, tableName string) (map[string]bool, error) {
+func getUniqueColumns(ctx context.Context, db *pgxpool.Pool, schemaName, tableName string) (map[string]bool, error) {
 	qualifiedName := schemaName + "." + tableName
 	query := `
 		SELECT a.attname
@@ -362,7 +364,7 @@ func getUniqueColumns(db *sql.DB, schemaName, tableName string) (map[string]bool
 		  AND array_length(i.indkey, 1) = 1
 	`
 
-	rows, err := db.Query(query, qualifiedName)
+	rows, err := db.Query(ctx, query, qualifiedName)
 	if err != nil {
 		return nil, err
 	}
