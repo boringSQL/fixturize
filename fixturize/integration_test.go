@@ -1313,3 +1313,234 @@ func TestSeedTableSkip(t *testing.T) {
 		t.Errorf("expected 1 org row, got %d", len(orgs.Rows))
 	}
 }
+
+// insertOrphans forces referentially-broken rows into the DB. Postgres would
+// normally reject these, so we disable FK triggers for the transaction with
+// SET LOCAL session_replication_role — the same mechanism apply uses. SET LOCAL
+// keeps the override scoped to this one tx, and running every statement on the
+// same tx avoids the pool handing us a different connection mid-setup.
+func insertOrphans(t *testing.T, db *pgxpool.Pool, inserts []string) {
+	t.Helper()
+	ctx := t.Context()
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin orphan tx: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "SET LOCAL session_replication_role = 'replica'"); err != nil {
+		t.Fatalf("disable FK triggers: %v", err)
+	}
+	for _, q := range inserts {
+		if _, err := tx.Exec(ctx, q); err != nil {
+			t.Fatalf("orphan insert failed: %s\n  %v", q, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit orphan tx: %v", err)
+	}
+}
+
+// findOrphanResult locates the result for a constraint by child table and the
+// exact set of FK columns — constraint names are PG-generated so we don't hard
+// code them.
+func findOrphanResult(results []OrphanResult, childTable string, cols ...string) (OrphanResult, bool) {
+	for _, r := range results {
+		if r.Constraint.ChildTable != childTable || len(r.Constraint.ChildCols) != len(cols) {
+			continue
+		}
+		match := true
+		for i := range cols {
+			if r.Constraint.ChildCols[i] != cols[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return r, true
+		}
+	}
+	return OrphanResult{}, false
+}
+
+func TestCheckOrphans(t *testing.T) {
+	resetDB(t, testDB)
+	seedAll(t, testDB)
+	ctx := t.Context()
+
+	insertOrphans(t, testDB, []string{
+		// single-column FK orphan: owner_id points at a non-existent user
+		`INSERT INTO projects (id, owner_id, name) VALUES (99, 9999, 'Orphan Project')`,
+		// another single-column FK orphan in a different table
+		`INSERT INTO task_comments (id, task_id, body) VALUES (99, 8888, 'Orphan comment')`,
+		// composite FK orphan: workspace_projects is empty, so any row is orphaned
+		`INSERT INTO project_assignments (id, workspace_id, project_id, assignee) VALUES (1, 1, 1, 'nobody')`,
+	})
+
+	schema, err := IntrospectSchema(ctx, testDB)
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+
+	results, err := CheckOrphans(ctx, testDB, schema, schema.GetTables(), CheckOptions{Samples: 5})
+	if err != nil {
+		t.Fatalf("check orphans: %v", err)
+	}
+
+	if total := TotalOrphans(results); total != 3 {
+		t.Errorf("expected 3 orphaned rows total, got %d", total)
+	}
+
+	projects, ok := findOrphanResult(results, "public.projects", "owner_id")
+	if !ok {
+		t.Fatal("missing result for projects.owner_id FK")
+	}
+	if projects.OrphanCount != 1 {
+		t.Errorf("expected 1 orphan in projects, got %d", projects.OrphanCount)
+	}
+	if len(projects.Samples) != 1 {
+		t.Fatalf("expected 1 sample row, got %d", len(projects.Samples))
+	}
+	if v := projects.Samples[0]["owner_id"]; fmt.Sprintf("%v", v) != "9999" {
+		t.Errorf("expected sample owner_id=9999, got %v", v)
+	}
+
+	comments, ok := findOrphanResult(results, "public.task_comments", "task_id")
+	if !ok {
+		t.Fatal("missing result for task_comments.task_id FK")
+	}
+	if comments.OrphanCount != 1 {
+		t.Errorf("expected 1 orphan in task_comments, got %d", comments.OrphanCount)
+	}
+
+	assignments, ok := findOrphanResult(results, "public.project_assignments", "workspace_id", "project_id")
+	if !ok {
+		t.Fatal("missing result for project_assignments composite FK")
+	}
+	if assignments.OrphanCount != 1 {
+		t.Errorf("expected 1 orphan in project_assignments, got %d", assignments.OrphanCount)
+	}
+
+	// a consistently-seeded FK must report zero orphans
+	users, ok := findOrphanResult(results, "public.users", "org_id")
+	if !ok {
+		t.Fatal("missing result for users.org_id FK")
+	}
+	if users.OrphanCount != 0 {
+		t.Errorf("expected 0 orphans in users, got %d", users.OrphanCount)
+	}
+}
+
+func TestCheckOrphansCleanDatabase(t *testing.T) {
+	resetDB(t, testDB)
+	seedAll(t, testDB)
+	ctx := t.Context()
+
+	schema, err := IntrospectSchema(ctx, testDB)
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+
+	results, err := CheckOrphans(ctx, testDB, schema, schema.GetTables(), CheckOptions{Samples: 3})
+	if err != nil {
+		t.Fatalf("check orphans: %v", err)
+	}
+
+	if total := TotalOrphans(results); total != 0 {
+		t.Errorf("expected 0 orphans on a consistently-seeded DB, got %d", total)
+	}
+	if !strings.Contains(FormatCheck(results), "satisfied") {
+		t.Errorf("expected clean summary for a healthy database")
+	}
+}
+
+// TestSuggestMissingFKsIntegration is an end-to-end test that exercises the
+// foreign key suggestion pipeline against a real database. It seeds an
+// unconstrained column with both a valid and an orphaned row, introspects the
+// schema, generates suggestions, and finally validates them.
+func TestSuggestMissingFKsIntegration(t *testing.T) {
+	// Reset the database to a known clean state before starting the test.
+	resetDB(t, testDB)
+	// Seed the standard fixture data, which creates projects with ids 1 and 2.
+	seedAll(t, testDB)
+	// Obtain a context that is tied to the lifecycle of this test.
+	ctx := t.Context()
+
+	// The workspace_projects.project_id column has no FK constraint. We insert
+	// one row that points at a real project and one row that points at a
+	// project id which does not exist. No replica-role trick is needed here
+	// because the column is genuinely unconstrained.
+	if _, err := testDB.Exec(ctx,
+		`INSERT INTO workspace_projects (workspace_id, project_id, name)
+		 VALUES (1, 1, 'real one'), (1, 777, 'dangling one')`); err != nil {
+		t.Fatalf("seed workspace_projects: %v", err)
+	}
+
+	// Introspect the live database to build the schema model.
+	schema, err := IntrospectSchema(ctx, testDB)
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+
+	// Generate the list of missing foreign key suggestions from the schema.
+	suggestions := SuggestMissingFKs(schema, schema.GetTables())
+
+	// Scan the suggestions to locate the two columns we care about.
+	var projectID, workspaceID *FKSuggestion
+	// Loop over every suggestion that was returned.
+	for i := range suggestions {
+		// Skip any suggestion that does not belong to the workspace_projects table.
+		if suggestions[i].ChildTable != "public.workspace_projects" {
+			continue
+		}
+		// Inspect the child column name and capture the relevant suggestions.
+		switch suggestions[i].ChildColumn {
+		case "project_id":
+			projectID = &suggestions[i]
+		case "workspace_id":
+			workspaceID = &suggestions[i]
+		}
+	}
+
+	// Verify that the project_id column produced a suggestion.
+	if projectID == nil {
+		t.Fatal("workspace_projects.project_id was not suggested")
+	}
+	// Verify that the project_id suggestion points at the correct parent.
+	if projectID.ParentTable != "public.projects" || projectID.ParentColumn != "id" {
+		t.Errorf("project_id should point at public.projects.id, got %s.%s",
+			projectID.ParentTable, projectID.ParentColumn)
+	}
+
+	// Verify that the workspace_id column was scanned.
+	if workspaceID == nil {
+		t.Fatal("workspace_projects.workspace_id was not scanned")
+	}
+	// Since there is no matching parent table, workspace_id should have no
+	// candidate parent table set.
+	if workspaceID.ParentTable != "" {
+		t.Errorf("workspace_id has no candidate parent, got %q", workspaceID.ParentTable)
+	}
+
+	// Verify that columns which already have a declared FK are never suggested.
+	for _, s := range suggestions {
+		if s.ChildTable == "public.users" && s.ChildColumn == "org_id" {
+			t.Error("users.org_id already has an FK and must not be suggested")
+		}
+	}
+
+	// Validate the suggestions against the database to detect orphaned rows.
+	if err := ValidateFKSuggestions(ctx, testDB, suggestions, SuggestFKOptions{Validate: true}); err != nil {
+		t.Fatalf("validate suggestions: %v", err)
+	}
+	// Confirm that the project_id suggestion was actually validated.
+	if !projectID.Checked {
+		t.Error("project_id suggestion should have been validated")
+	}
+	// Confirm that exactly one orphaned row was detected, which is the row that
+	// references the non-existent project 777.
+	if projectID.OrphanCount != 1 {
+		t.Errorf("expected 1 row with no parent (project 777), got %d", projectID.OrphanCount)
+	}
+}
