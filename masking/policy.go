@@ -2,6 +2,7 @@ package masking
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -9,6 +10,7 @@ type Policy struct {
 	dbID        string
 	qualified   map[string]struct{} // "schema.table.column"
 	unqualified map[string]struct{} // "table.column", any schema
+	exprs       map[string]string   // key → SQL expression
 }
 
 func Load(path, databaseID string, policyNames []string) (*Policy, error) {
@@ -26,6 +28,7 @@ func Load(path, databaseID string, policyNames []string) (*Policy, error) {
 		dbID:        databaseID,
 		qualified:   map[string]struct{}{},
 		unqualified: map[string]struct{}{},
+		exprs:       map[string]string{},
 	}
 
 	selected, err := selectColumns(db, policyNames)
@@ -34,6 +37,7 @@ func Load(path, databaseID string, policyNames []string) (*Policy, error) {
 	}
 	for _, key := range selected {
 		p.add(key)
+		p.exprs[key] = db.Columns[key].Expr
 	}
 	return p, nil
 }
@@ -55,6 +59,23 @@ func (p *Policy) DatabaseID() string {
 		return ""
 	}
 	return p.dbID
+}
+
+// sorted "key=expr"; nil-safe
+func (p *Policy) Expressions() []string {
+	if p == nil || len(p.exprs) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(p.exprs))
+	for k := range p.exprs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, fmt.Sprintf("%s=%s", k, p.exprs[k]))
+	}
+	return out
 }
 
 // malformed keys silently skipped — no logging from library code

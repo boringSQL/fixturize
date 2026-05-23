@@ -61,6 +61,9 @@ Examples:
 	extractInclude             string
 	extractExclude             string
 	extractMask                []string
+	extractMaskPolicy          []string
+	extractMasksFile           string
+	extractNoMasks             bool
 	extractFilter              []string
 	extractStatementTimeout    int
 	extractTransaction         bool
@@ -83,6 +86,9 @@ func init() {
 	extractCmd.Flags().StringVar(&extractInclude, "include", "", "Extra tables to include (comma-separated)")
 	extractCmd.Flags().StringVar(&extractExclude, "exclude", "", "Tables to skip (comma-separated)")
 	extractCmd.Flags().StringArrayVar(&extractMask, "mask", nil, "Mask column with SQL expression (table.column=expr, repeatable)")
+	extractCmd.Flags().StringVar(&extractMasksFile, "masks-file", "", "Path to shared masks file (overrides profile.masks_file and walk-up discovery)")
+	extractCmd.Flags().StringArrayVar(&extractMaskPolicy, "mask-policy", nil, "Mask policy name to apply (repeatable, overrides profile.extract.mask_policies)")
+	extractCmd.Flags().BoolVar(&extractNoMasks, "no-masks", false, "Disable all mask resolution (CLI, profile, discovery)")
 	extractCmd.Flags().StringArrayVar(&extractFilter, "filter", nil, "Per-table WHERE condition (table=expr, repeatable)")
 	extractCmd.Flags().IntVar(&extractStatementTimeout, "statement-timeout", 0, "Per-statement timeout in seconds")
 	extractCmd.Flags().BoolVar(&extractTransaction, "transaction", false, "Wrap SQL output in BEGIN/COMMIT")
@@ -96,8 +102,13 @@ func expandEnvVars(s string) string {
 }
 
 func runExtract(cmd *cobra.Command, args []string) error {
-	conn, root, seed, schema, output, limit, depth, include, exclude, masks, filters, statementTimeout := mergeExtractConfig(cmd)
+	conn, root, seed, schema, output, limit, depth, include, exclude, filters, statementTimeout := mergeExtractConfig(cmd)
 	format, transaction, onConflictDN := mergeFormatConfig(cmd)
+
+	masks, err := resolveExtractMasks(cmd)
+	if err != nil {
+		return err
+	}
 
 	if conn == "" {
 		conn = os.Getenv("DATABASE_URL")
@@ -191,7 +202,7 @@ func runExtract(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func mergeExtractConfig(cmd *cobra.Command) (conn, root, seed, schema, output string, limit, depth int, include, exclude, masks, filters []string, statementTimeout int) {
+func mergeExtractConfig(cmd *cobra.Command) (conn, root, seed, schema, output string, limit, depth int, include, exclude, filters []string, statementTimeout int) {
 	conn = extractConn
 	root = extractRoot
 	seed = extractSeed
@@ -201,7 +212,6 @@ func mergeExtractConfig(cmd *cobra.Command) (conn, root, seed, schema, output st
 	depth = extractDepth
 	include = parseCommaSeparated(extractInclude)
 	exclude = parseCommaSeparated(extractExclude)
-	masks = extractMask
 	filters = extractFilter
 	statementTimeout = extractStatementTimeout
 
@@ -257,9 +267,6 @@ func mergeExtractConfig(cmd *cobra.Command) (conn, root, seed, schema, output st
 	if !cmd.Flags().Changed("exclude") && len(exclude) == 0 {
 		exclude = p.Extract.Exclude
 	}
-	if !cmd.Flags().Changed("mask") && len(masks) == 0 {
-		masks = p.ResolveMasks()
-	}
 	if !cmd.Flags().Changed("filter") && len(filters) == 0 {
 		for table, expr := range p.Extract.Filters {
 			filters = append(filters, table+"="+expr)
@@ -267,6 +274,31 @@ func mergeExtractConfig(cmd *cobra.Command) (conn, root, seed, schema, output st
 	}
 
 	return
+}
+
+// --mask is additive; --no-masks suppresses file+profile lookup but keeps --mask entries
+func resolveExtractMasks(cmd *cobra.Command) ([]string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get working directory: %w", err)
+	}
+
+	opts := fixturize.ResolveMasksOptions{
+		FlagFile:     extractMasksFile,
+		FlagPolicies: extractMaskPolicy,
+		Disabled:     extractNoMasks,
+		Cwd:          cwd,
+	}
+
+	resolved, err := fixturize.ResolveMasks(loadedProfile, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(extractMask) == 0 {
+		return resolved, nil
+	}
+	return append(append([]string{}, resolved...), extractMask...), nil
 }
 
 func parseCommaSeparated(s string) []string {
