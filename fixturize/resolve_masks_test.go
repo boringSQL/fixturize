@@ -270,6 +270,83 @@ extract:
 	}
 }
 
+// explicitly configured masks_file without database_id is a config bug —
+// error loudly so unmasked fixtures don't ship silently.
+func TestResolveMasks_ExplicitFileNoDatabaseID(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "masks.yml"), `
+version: 1
+databases:
+  app:
+    columns:
+      users.email: { expr: "'x'", tags: [pii] }
+    policies:
+      pii: { include_tags: [pii] }
+`)
+	profilePath := filepath.Join(dir, "profile.yaml")
+	writeFile(t, profilePath, `
+masks_file: masks.yml
+extract:
+  root: "users WHERE id = 1"
+`)
+	_, err := ResolveMasks(mustLoad(t, profilePath), ResolveMasksOptions{})
+	if err == nil || !strings.Contains(err.Error(), "database_id") {
+		t.Fatalf("expected database_id error, got %v", err)
+	}
+}
+
+// same, but via --masks-file flag instead of profile field.
+func TestResolveMasks_FlagFileNoDatabaseID(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "masks.yml"), `
+version: 1
+databases:
+  app:
+    columns:
+      users.email: { expr: "'x'", tags: [pii] }
+    policies:
+      pii: { include_tags: [pii] }
+`)
+	profilePath := filepath.Join(dir, "profile.yaml")
+	writeFile(t, profilePath, `
+extract:
+  root: "users WHERE id = 1"
+`)
+	_, err := ResolveMasks(mustLoad(t, profilePath), ResolveMasksOptions{
+		FlagFile: filepath.Join(dir, "masks.yml"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "database_id") {
+		t.Fatalf("expected database_id error, got %v", err)
+	}
+}
+
+// monorepo case: walk-up finds an ancestor masks file but the profile
+// doesn't set database_id → silently skip, don't force the user to opt out.
+func TestResolveMasks_DiscoveredFileNoDatabaseID(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "data-masking-policy.yml"), `
+version: 1
+databases:
+  app:
+    columns:
+      users.email: { expr: "'x'", tags: [pii] }
+    policies:
+      pii: { include_tags: [pii] }
+`)
+	profilePath := filepath.Join(root, "sub", "profile.yaml")
+	writeFile(t, profilePath, `
+extract:
+  root: "users WHERE id = 1"
+`)
+	got, err := ResolveMasks(mustLoad(t, profilePath), ResolveMasksOptions{})
+	if err != nil {
+		t.Fatalf("ResolveMasks: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil (no opt-in via database_id); got %v", got)
+	}
+}
+
 // --no-masks suppresses everything: file, inline, raw extract.masks
 func TestResolveMasks_Disabled(t *testing.T) {
 	dir := t.TempDir()
