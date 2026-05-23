@@ -3,6 +3,7 @@ package fixturize
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -77,13 +78,20 @@ func ResolveMasks(profile *Profile, opts ResolveMasksOptions) ([]string, error) 
 		filePolicyNames  map[string]struct{}
 		databaseIDInFile bool
 	)
+	// explicit masks file (flag or profile) without database_id is a config bug — error loudly.
+	// a discovered file (walk-up) is opportunistic context: warn and skip, don't force opt-out.
+	if path != "" && databaseID == "" {
+		explicit := flagFile != "" || profileFile != ""
+		if explicit {
+			return nil, fmt.Errorf("masks file %s configured but profile/flag did not set database_id", path)
+		}
+		fmt.Fprintf(os.Stderr, "Warning: discovered masks file %s but profile has no database_id — skipping (no masking applied)\n", path)
+		path = ""
+	}
 	if path != "" {
 		shared, err := masking.LoadSharedMasks(path)
 		if err != nil {
 			return nil, err
-		}
-		if databaseID == "" {
-			return nil, fmt.Errorf("masks file %s configured but profile/flag did not set database_id", path)
 		}
 		db, ok := shared.Databases[databaseID]
 		if !ok {
