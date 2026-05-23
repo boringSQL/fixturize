@@ -5,37 +5,27 @@ import (
 	"strings"
 )
 
-type (
-	Policy struct {
-		dbID        string
-		qualified   map[string]struct{} // "schema.table.column"
-		unqualified map[string]struct{} // "table.column", any schema
-	}
+type Policy struct {
+	dbID        string
+	qualified   map[string]struct{} // "schema.table.column"
+	unqualified map[string]struct{} // "table.column", any schema
+}
 
-	// AllowMissingDatabase: missing database_id → empty Policy, not error.
-	LoadOptions struct {
-		AllowMissingDatabase bool
-	}
-)
-
-func Load(path, databaseID string, policyNames []string, opts LoadOptions) (*Policy, error) {
+func Load(path, databaseID string, policyNames []string) (*Policy, error) {
 	f, err := LoadSharedMasks(path)
 	if err != nil {
 		return nil, err
+	}
+
+	db, ok := f.Databases[databaseID]
+	if !ok {
+		return nil, fmt.Errorf("masks file %s has no entry for database_id %q", path, databaseID)
 	}
 
 	p := &Policy{
 		dbID:        databaseID,
 		qualified:   map[string]struct{}{},
 		unqualified: map[string]struct{}{},
-	}
-
-	db, ok := f.Databases[databaseID]
-	if !ok {
-		if !opts.AllowMissingDatabase {
-			return nil, fmt.Errorf("masks file %s has no entry for database_id %q", path, databaseID)
-		}
-		return p, nil
 	}
 
 	selected, err := selectColumns(db, policyNames)
